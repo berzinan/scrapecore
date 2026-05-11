@@ -109,10 +109,12 @@ class TaskQueue:
         """
         await self._store_payload(task_id, payload)
 
+        # claim() pops from the RIGHT end of the list, so high-priority
+        # items must be pushed to the RIGHT to be claimed first.
         if priority > 0:
-            await self._redis.lpush(self._pending_key, task_id)
-        else:
             await self._redis.rpush(self._pending_key, task_id)
+        else:
+            await self._redis.lpush(self._pending_key, task_id)
 
         logger.debug(f"[{self._ns}] Pushed task {task_id} (priority={priority})")
 
