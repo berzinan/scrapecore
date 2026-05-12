@@ -110,7 +110,7 @@ class Agent:
         # Per-domain rate limiting — maps domain → last request time
         self._rate_lock: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}
-        self._min_delay = 1.0 / requests_per_second
+        self._min_delay = 1.0 / (requests_per_second / num_workers)
 
         # Statistics
         self.tasks_completed = 0
