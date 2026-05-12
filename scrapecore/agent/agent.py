@@ -68,6 +68,7 @@ class Agent:
                            looping. Lower = faster shutdown response.
         heartbeat_interval: Seconds between heartbeat writes to Redis.
         task_timeout:      Seconds before an HTTP request is abandoned.
+        proxy:             #TODO: add docstring desc
     """
 
     def __init__(
@@ -81,6 +82,7 @@ class Agent:
         claim_timeout: float = 5.0,
         heartbeat_interval: float = 10.0,
         task_timeout: int = 30,
+        proxy: Optional[str] = None,
     ) -> None:
         self.agent_id = agent_id
         self._redis = redis
@@ -101,6 +103,9 @@ class Agent:
 
         # aiohttp session — created on start, shared across all workers
         self._session: Optional[aiohttp.ClientSession] = None
+
+        # Proxy
+        self._proxy = proxy
 
         # Per-domain rate limiting — maps domain → last request time
         self._rate_lock: dict[str, asyncio.Lock] = {}
@@ -242,6 +247,7 @@ class Agent:
                 headers=headers,
                 params=params,
                 json=body,
+                proxy=self._proxy,
             ) as response:
                 response.raise_for_status()
                 content_type = response.headers.get("Content-Type", "")
