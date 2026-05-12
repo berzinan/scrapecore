@@ -258,7 +258,11 @@ class Agent:
                     raw = await response.text()
 
         except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                logger.warning(f"429 from {url} — backing off 60s")
+                await asyncio.sleep(60)
             raise RuntimeError(f"HTTP {e.status} from {url}: {e.message}")
+
         except aiohttp.ClientError as e:
             raise RuntimeError(f"Network error fetching {url}: {e}")
 
