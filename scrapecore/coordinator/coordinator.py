@@ -230,6 +230,13 @@ class Coordinator:
                     if job_id in self._dispatched:
                         continue
                     if self._store.is_cancelled(job_id):
+                        await self._redis.sadd(
+                            f"scrapecore:{self._namespace}:cancelled_jobs", job_id
+                        )
+                        await self._redis.expire(
+                            f"scrapecore:{self._namespace}:cancelled_jobs", 3600
+                        )
+                        logger.info(f"Dropping result for cancelled job {job_id}")
                         continue
 
                     try:

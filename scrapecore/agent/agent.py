@@ -194,11 +194,14 @@ class Agent:
                 await self._task_queue.acknowledge(task_id)
                 self.tasks_completed += 1
             else:
-                if envelope.should_retry():
+                cancelled = await self._redis.sismember(
+                    f"scrapecore:{self._namespace}:cancelled_jobs", envelope.job_id
+                )
+                if cancelled or not envelope.should_retry():
+                    await self._task_queue.acknowledge(task_id)
+                else:
                     retried = envelope.increment_retry()
                     await self._task_queue.reject(task_id, retried.to_dict(), retried.priority)
-                else:
-                    await self._task_queue.acknowledge(task_id)
                 self.tasks_failed += 1
 
             self._active_tasks.discard(task_id)
