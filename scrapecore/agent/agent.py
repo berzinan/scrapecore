@@ -245,14 +245,16 @@ class Agent:
 
         try:
             async with self._session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                json=body,
-                proxy=self._proxy,
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=body,
+                    proxy=self._proxy,
             ) as response:
                 response.raise_for_status()
+                peername = response.connection.transport.get_extra_info("peername")
+                logger.info(f"[agent] {url} — exit IP: {peername}")
                 content_type = response.headers.get("Content-Type", "")
 
                 if "application/json" in content_type:
