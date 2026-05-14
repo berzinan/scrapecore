@@ -210,8 +210,16 @@ class Coordinator:
         logger.info("Coordinator stopped")
 
     async def stop(self) -> None:
+        """#TODO: Docstring"""
         logger.info("Coordinator stop requested")
         self._stop_event.set()
+
+    async def cancel_job(self, job_id: str) -> int:
+        """#TODO: Docstring"""
+        self._tracker.cleanup(job_id)
+        removed = await self._task_queue.cancel_job_tasks(job_id)
+        logger.info(f"Coordinator cancelled job {job_id}: {removed} pending task(s) removed from Redis")
+        return removed
 
     # ── Loop 1: dispatch ──────────────────────────────────────────────────────
 

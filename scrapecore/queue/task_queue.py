@@ -193,6 +193,19 @@ class TaskQueue:
         await self.push(task_id, payload, priority=priority)
         logger.debug(f"[{self._ns}] Rejected task {task_id} — re-enqueued")
 
+    async def cancel_job_tasks(self, job_id: str) -> int:
+        """#TODO: Add docstring"""
+        pending_ids = await self._redis.lrange(self._pending_key, 0, -1)
+        removed = 0
+        for task_id in pending_ids:
+            payload = await self._load_payload(task_id)
+            if payload and payload.get("job_id") == job_id:
+                await self._redis.lrem(self._pending_key, 1, task_id)
+                await self._delete_payload(task_id)
+                removed += 1
+                logger.info(f"[{self._ns}] Cancelled pending task {task_id} for job {job_id}")
+        return removed
+
     # ── Recovery API (coordinator) ────────────────────────────────────────────
 
     async def recover_stale(self, stale_after_seconds: float = 60.0) -> int:
