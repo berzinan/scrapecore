@@ -253,10 +253,7 @@ class Agent:
                     proxy=self._proxy,
             ) as response:
                 response.raise_for_status()
-                peername = response.connection.transport.get_extra_info("peername")
-                logger.info(f"[agent] {url} — exit IP: {peername}")
                 content_type = response.headers.get("Content-Type", "")
-
                 if "application/json" in content_type:
                     raw = await response.json()
                 else:
