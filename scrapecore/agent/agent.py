@@ -1,34 +1,4 @@
-"""
-scrapecore/agent/agent.py
-
-Agent — the remote worker process.
-
-An agent is started on each machine that participates in the scraping network.
-It connects to Redis, registers its parser functions, and enters a polling loop.
-
-Lifecycle:
-    1. Consumer calls Agent(...) with a parser registry and config
-    2. Consumer calls await agent.start() — this blocks until stop() is called
-    3. Internally: N worker coroutines run concurrently, each polling the task queue
-    4. Each worker: claim → execute → push result → repeat
-    5. A heartbeat coroutine runs alongside, writing a timestamp to Redis every N seconds
-    6. Consumer calls await agent.stop() to drain in-progress tasks and shut down
-
-Parser registry format:
-    {
-        "autopiter.parse_appraise":    parse_appraise,
-        "autopiter.parse_searchdetails": parse_searchdetails,
-    }
-
-The key must match the parser_key field in TaskEnvelope exactly.
-The value is any async or sync callable with the signature:
-    parser(raw_response: Any, metadata: dict) -> dict
-
-Note on sync vs async parsers:
-    The existing parsers in gng_pricing are synchronous functions.
-    The agent runs them in a thread executor to avoid blocking the event loop.
-    This means no changes are needed to existing parser code.
-"""
+# scrapecore/agent/agent.py
 
 from __future__ import annotations
 
@@ -38,10 +8,10 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
-import aiohttp
 import redis.asyncio as aioredis
+
 from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError  # ← new
-from scrapecore.http.aiohttp_backend import AiohttpBackend
+from scrapecore.http.aiohttp_backend import AiohttpBackend                    # ← new
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
@@ -49,7 +19,6 @@ from scrapecore.queue.result_queue import ResultQueue
 
 logger = logging.getLogger(__name__)
 
-# Type alias for parser functions registered by the consumer
 ParserFn = Callable[[Any, dict], Any]
 
 
@@ -109,39 +78,20 @@ class Agent:
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
 
-        # Tracks task_ids currently held by this agent
         self._active_tasks: set[str] = set()
         self._stop_event = asyncio.Event()
 
-        # aiohttp session — created on start, shared across all workers
-        self._session: Optional[aiohttp.ClientSession] = None
-
-        # Proxy
-        self._proxy = proxy
-
-        # Per-domain rate limiting — maps domain → last request time
         self._rate_lock: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}
         self._min_delay = 1.0 / (requests_per_second / num_workers)
 
-        # Statistics
         self.tasks_completed = 0
         self.tasks_failed = 0
-
-        # Per-parser_key request counters, used to correlate 429s with
-        # cumulative call counts/elapsed time rather than wall-clock guesses.
-        self._stage_counts: dict[str, int] = {}
-        self._stage_started_at: Optional[float] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """
-        Start the agent. Blocks until stop() is called.
-
-        Creates an aiohttp session, spawns worker coroutines and the heartbeat
-        loop, then waits for the stop event.
-        """
+        """Start the agent. Blocks until stop() is called."""
         logger.info(f"Agent {self.agent_id!r} starting ({self._num_workers} workers)")
 
         # ← removed: aiohttp.ClientSession creation — backend owns its session now
@@ -158,21 +108,12 @@ class Agent:
         logger.info(f"Agent {self.agent_id!r} shut down cleanly")
 
     async def stop(self) -> None:
-        """
-        Signal the agent to stop after finishing in-progress tasks.
-        """
         logger.info(f"Agent {self.agent_id!r} stop requested")
         self._stop_event.set()
 
     # ── Worker loop ───────────────────────────────────────────────────────────
 
     async def _worker_loop(self, worker_index: int) -> None:
-        """
-        Main loop for a single worker coroutine.
-
-        Runs until the stop event is set AND there are no active tasks
-        on this agent (clean drain).
-        """
         worker_id = f"{self.agent_id}:worker-{worker_index}"
         logger.debug(f"Worker {worker_id} started")
 
@@ -188,7 +129,6 @@ class Agent:
             try:
                 result = await self._execute(envelope)
             except Exception as e:
-                # Catch-all so a bug in _execute never kills the worker loop
                 logger.error(f"Unhandled error in worker {worker_id}: {e}", exc_info=True)
                 result = ResultEnvelope.failure(
                     task_id=envelope.task_id,
@@ -224,17 +164,6 @@ class Agent:
     async def _execute(self, envelope: TaskEnvelope) -> ResultEnvelope:
         """
         Resolve the parser, make the HTTP request, call the parser, return result.
-
-        The payload dict is expected to contain:
-            url:      str  — target URL
-            method:   str  — HTTP method, default "GET"
-            headers:  dict — extra headers
-            params:   dict — query parameters (appended to URL)
-            body:     dict — JSON body for POST requests
-            metadata: dict — passed through to the parser unchanged
-
-        The parser receives (raw_response, metadata) and returns a dict.
-        Sync parsers are run in a thread executor to avoid blocking the loop.
         """
         payload  = envelope.payload
         url      = payload["url"]
@@ -251,21 +180,9 @@ class Agent:
                 f"Registered: {list(self._registry.keys())}"
             )
 
-        # Rate limiting
         await self._rate_limit(url)
 
-        if self._stage_started_at is None:
-            self._stage_started_at = time.monotonic()
-        self._stage_counts[envelope.parser_key] = (
-                self._stage_counts.get(envelope.parser_key, 0) + 1
-        )
-        elapsed = time.monotonic() - self._stage_started_at
-        if self._stage_counts[envelope.parser_key] % 25 == 0:
-            logger.info(
-                f"[stage_stats] elapsed={elapsed:6.1f}s "
-                f"counts={dict(self._stage_counts)}"
-            )
-
+        # ← replaced: aiohttp request block → backend call
         try:
             response = await self._backend.request(
                 method,
@@ -276,13 +193,9 @@ class Agent:
                 proxy=self._proxy,
             )
         except HttpBackendError as e:
+            # ← restored: 429 back-off lives here, not in the backend
             if e.status == 429:
-                logger.warning(
-                    f"429 from {url} (parser={envelope.parser_key}) after "
-                    f"{self._stage_counts[envelope.parser_key]} calls to this "
-                    f"stage, {elapsed:.1f}s since first request — "
-                    f"headers={e.headers} body={e.message[:300]!r}"
-                )
+                logger.warning(f"429 from {url} — backing off 60s")
                 await asyncio.sleep(60)
             raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
 
@@ -301,16 +214,12 @@ class Agent:
         else:
             parsed = await loop.run_in_executor(None, parser_fn, raw, metadata)
 
-        # parsed must be a dict — the serialization contract requires it.
-        # If the consumer's parser returns a dataclass or custom object,
-        # it should call .to_dict() itself before returning.
         if not isinstance(parsed, dict):
             raise TypeError(
                 f"Parser {envelope.parser_key!r} must return a dict, "
                 f"got {type(parsed).__name__}"
             )
 
-        # Separate top-level output from any stage_output the parser signals
         stage_output = parsed.pop("__stage_output__", None)
 
         return ResultEnvelope.success(
@@ -326,12 +235,6 @@ class Agent:
     # ── Rate limiting ─────────────────────────────────────────────────────────
 
     async def _rate_limit(self, url: str) -> None:
-        """
-        Per-domain rate limiting using an asyncio lock per domain.
-        Serialises requests to the same domain and enforces min_delay between them.
-        This is the local (per-agent) limiter.
-        The distributed limiter (coordinator-side) is built in the next step.
-        """
         from urllib.parse import urlparse
         domain = urlparse(url).netloc
 
@@ -348,17 +251,7 @@ class Agent:
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        """
-        Writes a timestamp to Redis every heartbeat_interval seconds.
-
-        Key: scrapecore:{namespace}:heartbeat:{agent_id}
-        Value: current unix timestamp as a string
-        Expiry: heartbeat_interval * 3 — auto-expires if agent dies
-
-        The coordinator checks these keys to determine which agents are alive.
-        An agent with no heartbeat key is considered dead.
-        """
-        key = f"scrapecore:{self._namespace}:heartbeat:{self.agent_id}"
+        key    = f"scrapecore:{self._namespace}:heartbeat:{self.agent_id}"
         expiry = int(self._heartbeat_interval * 3)
 
         while not self._stop_event.is_set():
@@ -372,7 +265,6 @@ class Agent:
             except asyncio.TimeoutError:
                 pass
 
-        # Delete heartbeat key on clean shutdown so coordinator knows immediately
         await self._redis.delete(key)
         logger.debug(f"Heartbeat key deleted for agent {self.agent_id!r}")
 
