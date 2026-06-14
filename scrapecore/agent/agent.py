@@ -33,13 +33,15 @@ Note on sync vs async parsers:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Callable, Optional
 
 import aiohttp
 import redis.asyncio as aioredis
-
+from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError  # ← new
+from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
@@ -56,19 +58,21 @@ class Agent:
     Remote worker process. Polls the task queue and executes scrape tasks.
 
     Args:
-        agent_id:          Unique name for this agent instance. Used in heartbeats
-                           and result envelopes. E.g. "machine-01".
-        redis:             Connected async Redis client.
-        parser_registry:   Dict mapping parser_key strings to callable parsers.
-        namespace:         Must match the namespace used by the coordinator.
-        num_workers:       Number of concurrent worker coroutines.
-        requests_per_second: Rate limit applied per domain across all workers
-                           on this agent. Shared with the distributed limiter.
-        claim_timeout:     Seconds a worker blocks on an empty queue before
-                           looping. Lower = faster shutdown response.
-        heartbeat_interval: Seconds between heartbeat writes to Redis.
-        task_timeout:      Seconds before an HTTP request is abandoned.
-        proxy:             #TODO: add docstring desc
+        agent_id:            Unique name for this agent instance.
+        redis:               Connected async Redis client.
+        parser_registry:     Dict mapping parser_key strings to callable parsers.
+        namespace:           Must match the namespace used by the coordinator.
+        num_workers:         Number of concurrent worker coroutines.
+        requests_per_second: Rate limit applied per domain across all workers.
+        claim_timeout:       Seconds a worker blocks on an empty queue before looping.
+        heartbeat_interval:  Seconds between heartbeat writes to Redis.
+        task_timeout:        Seconds before an HTTP request is abandoned.
+                             Ignored if a custom http_backend is provided.
+        proxy:               Proxy URL forwarded to every backend request.
+                             Ignored if a custom http_backend is provided.
+        http_backend:        HTTP backend to use for all requests.
+                             Defaults to AiohttpBackend(timeout=task_timeout).
+                             Pass a CurlCffiBackend instance for bot-protected sites.
     """
 
     def __init__(
@@ -83,6 +87,7 @@ class Agent:
         heartbeat_interval: float = 10.0,
         task_timeout: int = 30,
         proxy: Optional[str] = None,
+        http_backend: Optional[HttpBackend] = None,   # ← new
     ) -> None:
         self.agent_id = agent_id
         self._redis = redis
@@ -93,6 +98,13 @@ class Agent:
         self._claim_timeout = claim_timeout
         self._heartbeat_interval = heartbeat_interval
         self._task_timeout = task_timeout
+        self._proxy = proxy
+
+        # ← new: default to AiohttpBackend so existing call sites need no change
+        self._backend: HttpBackend = (
+            http_backend if http_backend is not None
+            else AiohttpBackend(timeout=task_timeout)
+        )
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
@@ -116,6 +128,11 @@ class Agent:
         self.tasks_completed = 0
         self.tasks_failed = 0
 
+        # Per-parser_key request counters, used to correlate 429s with
+        # cumulative call counts/elapsed time rather than wall-clock guesses.
+        self._stage_counts: dict[str, int] = {}
+        self._stage_started_at: Optional[float] = None
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -127,23 +144,17 @@ class Agent:
         """
         logger.info(f"Agent {self.agent_id!r} starting ({self._num_workers} workers)")
 
-        timeout = aiohttp.ClientTimeout(total=self._task_timeout)
-        self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(force_close=True),
-            timeout=timeout,
-            headers={"User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )},
-        )
+        # ← removed: aiohttp.ClientSession creation — backend owns its session now
 
-        async with asyncio.TaskGroup() as tg:
-            for i in range(self._num_workers):
-                tg.create_task(self._worker_loop(worker_index=i))
-            tg.create_task(self._heartbeat_loop())
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for i in range(self._num_workers):
+                    tg.create_task(self._worker_loop(worker_index=i))
+                tg.create_task(self._heartbeat_loop())
+        finally:
+            # ← new: always close the backend even if a worker raises
+            await self._backend.close()
 
-        await self._session.close()
         logger.info(f"Agent {self.agent_id!r} shut down cleanly")
 
     async def stop(self) -> None:
@@ -225,12 +236,12 @@ class Agent:
         The parser receives (raw_response, metadata) and returns a dict.
         Sync parsers are run in a thread executor to avoid blocking the loop.
         """
-        payload = envelope.payload
-        url = payload["url"]
-        method = payload.get("method", "GET")
-        headers = payload.get("headers", {})
-        params = payload.get("params")
-        body = payload.get("body")
+        payload  = envelope.payload
+        url      = payload["url"]
+        method   = payload.get("method", "GET")
+        headers  = payload.get("headers", {})
+        params   = payload.get("params")
+        body     = payload.get("body")
         metadata = payload.get("metadata", {})
 
         parser_fn = self._registry.get(envelope.parser_key)
@@ -243,33 +254,47 @@ class Agent:
         # Rate limiting
         await self._rate_limit(url)
 
+        if self._stage_started_at is None:
+            self._stage_started_at = time.monotonic()
+        self._stage_counts[envelope.parser_key] = (
+                self._stage_counts.get(envelope.parser_key, 0) + 1
+        )
+        elapsed = time.monotonic() - self._stage_started_at
+        if self._stage_counts[envelope.parser_key] % 25 == 0:
+            logger.info(
+                f"[stage_stats] elapsed={elapsed:6.1f}s "
+                f"counts={dict(self._stage_counts)}"
+            )
+
         try:
-            async with self._session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=body,
-                    proxy=self._proxy,
-            ) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    raw = await response.json()
-                else:
-                    raw = await response.text()
-
-        except aiohttp.ClientResponseError as e:
+            response = await self._backend.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                body=body,
+                proxy=self._proxy,
+            )
+        except HttpBackendError as e:
             if e.status == 429:
-                logger.warning(f"429 from {url} — backing off 60s")
+                logger.warning(
+                    f"429 from {url} (parser={envelope.parser_key}) after "
+                    f"{self._stage_counts[envelope.parser_key]} calls to this "
+                    f"stage, {elapsed:.1f}s since first request — "
+                    f"headers={e.headers} body={e.message[:300]!r}"
+                )
                 await asyncio.sleep(60)
-            raise RuntimeError(f"HTTP {e.status} from {url}: {e.message}")
+            raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
 
-        except aiohttp.ClientError as e:
-            raise RuntimeError(f"Network error fetching {url}: {e}")
+        except NetworkError as e:
+            raise RuntimeError(str(e))
 
-        # Call the parser — run sync functions in a thread so they don't
-        # block the event loop while parsing large HTML or JSON responses.
+        # ← updated: parse text → JSON ourselves using response.content_type
+        if "application/json" in response.content_type:
+            raw = json.loads(response.text)
+        else:
+            raw = response.text
+
         loop = asyncio.get_running_loop()
         if asyncio.iscoroutinefunction(parser_fn):
             parsed = await parser_fn(raw, metadata)
@@ -314,7 +339,7 @@ class Agent:
             self._rate_lock[domain] = asyncio.Lock()
 
         async with self._rate_lock[domain]:
-            now = time.monotonic()
+            now  = time.monotonic()
             wait = self._min_delay - (now - self._last_request.get(domain, 0.0))
             if wait > 0:
                 await asyncio.sleep(wait)
