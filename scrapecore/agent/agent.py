@@ -88,6 +88,11 @@ class Agent:
         self.tasks_completed = 0
         self.tasks_failed = 0
 
+        # Per-parser_key request counters, used to correlate 429s with
+        # cumulative call counts/elapsed time rather than wall-clock guesses.
+        self._stage_counts: dict[str, int] = {}
+        self._stage_started_at: Optional[float] = None
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -182,7 +187,18 @@ class Agent:
 
         await self._rate_limit(url)
 
-        # ← replaced: aiohttp request block → backend call
+        if self._stage_started_at is None:
+            self._stage_started_at = time.monotonic()
+        self._stage_counts[envelope.parser_key] = (
+                self._stage_counts.get(envelope.parser_key, 0) + 1
+        )
+        elapsed = time.monotonic() - self._stage_started_at
+        if self._stage_counts[envelope.parser_key] % 25 == 0:
+            logger.info(
+                f"[stage_stats] elapsed={elapsed:6.1f}s "
+                f"counts={dict(self._stage_counts)}"
+            )
+
         try:
             response = await self._backend.request(
                 method,
@@ -193,9 +209,13 @@ class Agent:
                 proxy=self._proxy,
             )
         except HttpBackendError as e:
-            # ← restored: 429 back-off lives here, not in the backend
             if e.status == 429:
-                logger.warning(f"429 from {url} — backing off 60s")
+                logger.warning(
+                    f"429 from {url} (parser={envelope.parser_key}) after "
+                    f"{self._stage_counts[envelope.parser_key]} calls to this "
+                    f"stage, {elapsed:.1f}s since first request — "
+                    f"headers={e.headers} body={e.message[:300]!r}"
+                )
                 await asyncio.sleep(60)
             raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
 
