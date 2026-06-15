@@ -16,10 +16,12 @@ class HttpResponse:
         content_type: Value of the Content-Type response header, or "".
         text:         Response body as a decoded string.
                       The agent JSON-parses this if content_type indicates JSON.
+        headers:      #TODO: Fill this in.
     """
     status:       int
     content_type: str
     text:         str
+    headers:      dict[str, str]
 
 
 class HttpBackendError(Exception):
