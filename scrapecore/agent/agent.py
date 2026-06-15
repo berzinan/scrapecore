@@ -7,7 +7,6 @@ import json
 import logging
 import time
 from typing import Any, Callable, Optional
-
 import redis.asyncio as aioredis
 
 from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError  # ← new
@@ -16,9 +15,9 @@ from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
+from scrapecore.plugins.auth import BaseAuth
 
 logger = logging.getLogger(__name__)
-
 ParserFn = Callable[[Any, dict], Any]
 
 
@@ -42,6 +41,7 @@ class Agent:
         http_backend:        HTTP backend to use for all requests.
                              Defaults to AiohttpBackend(timeout=task_timeout).
                              Pass a CurlCffiBackend instance for bot-protected sites.
+        auth_provider:       #TODO: Fill this in
     """
 
     def __init__(
@@ -56,7 +56,8 @@ class Agent:
         heartbeat_interval: float = 10.0,
         task_timeout: int = 30,
         proxy: Optional[str] = None,
-        http_backend: Optional[HttpBackend] = None,   # ← new
+        http_backend: Optional[HttpBackend] = None,
+        auth_provider: BaseAuth | None = None
     ) -> None:
         self.agent_id = agent_id
         self._redis = redis
@@ -69,11 +70,13 @@ class Agent:
         self._task_timeout = task_timeout
         self._proxy = proxy
 
-        # ← new: default to AiohttpBackend so existing call sites need no change
+        # Defaults to AiohttpBackend. Override with curl_cffi available.
         self._backend: HttpBackend = (
             http_backend if http_backend is not None
             else AiohttpBackend(timeout=task_timeout)
         )
+
+        self._auth_provider = auth_provider
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
@@ -98,21 +101,17 @@ class Agent:
     async def start(self) -> None:
         """Start the agent. Blocks until stop() is called."""
         logger.info(f"Agent {self.agent_id!r} starting ({self._num_workers} workers)")
-
-        # ← removed: aiohttp.ClientSession creation — backend owns its session now
-
         try:
             async with asyncio.TaskGroup() as tg:
                 for i in range(self._num_workers):
                     tg.create_task(self._worker_loop(worker_index=i))
                 tg.create_task(self._heartbeat_loop())
         finally:
-            # ← new: always close the backend even if a worker raises
             await self._backend.close()
-
         logger.info(f"Agent {self.agent_id!r} shut down cleanly")
 
     async def stop(self) -> None:
+        """Stop the agent."""
         logger.info(f"Agent {self.agent_id!r} stop requested")
         self._stop_event.set()
 
@@ -168,7 +167,7 @@ class Agent:
 
     async def _execute(self, envelope: TaskEnvelope) -> ResultEnvelope:
         """
-        Resolve the parser, make the HTTP request, call the parser, return result.
+        Resolve parser -> make HTTP request -> call parser -> return result.
         """
         payload  = envelope.payload
         url      = payload["url"]
@@ -200,6 +199,11 @@ class Agent:
             )
 
         try:
+            if self._auth_provider:
+                headers = await self._auth_provider.prepare_request(
+                    headers,
+                    url,
+                )
             response = await self._backend.request(
                 method,
                 url,
@@ -208,6 +212,12 @@ class Agent:
                 body=body,
                 proxy=self._proxy,
             )
+            if self._auth_provider:
+                await self._auth_provider.handle_response(
+                    response.status,
+                    {},
+                    url,
+                )
         except HttpBackendError as e:
             if e.status == 429:
                 logger.warning(
