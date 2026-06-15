@@ -1,5 +1,4 @@
 # scrapecore/agent/agent.py
-
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +33,7 @@ class Agent:
         requests_per_second: Rate limit applied per domain across all workers.
         claim_timeout:       Seconds a worker blocks on an empty queue before looping.
         heartbeat_interval:  Seconds between heartbeat writes to Redis.
-        task_timeout:        Seconds before an HTTP request is abandoned.
+        task_timeout:        Seconds before a HTTP request is abandoned.
                              Ignored if a custom http_backend is provided.
         proxy:               Proxy URL forwarded to every backend request.
                              Ignored if a custom http_backend is provided.
@@ -172,7 +171,7 @@ class Agent:
         payload  = envelope.payload
         url      = payload["url"]
         method   = payload.get("method", "GET")
-        headers  = payload.get("headers", {})
+        headers  = dict(payload.get("headers", {}))
         params   = payload.get("params")
         body     = payload.get("body")
         metadata = payload.get("metadata", {})
@@ -212,13 +211,13 @@ class Agent:
                 body=body,
                 proxy=self._proxy,
             )
+        except HttpBackendError as e:
             if self._auth_provider:
                 await self._auth_provider.handle_response(
-                    response.status,
-                    {},
+                    e.status,
+                    e.headers,
                     url,
                 )
-        except HttpBackendError as e:
             if e.status == 429:
                 logger.warning(
                     f"429 from {url} (parser={envelope.parser_key}) after "
@@ -231,6 +230,15 @@ class Agent:
 
         except NetworkError as e:
             raise RuntimeError(str(e))
+
+        else:
+            # Successful response hook
+            if self._auth_provider:
+                await self._auth_provider.handle_response(
+                    response.status,
+                    response.headers,
+                    url
+                )
 
         # ← updated: parse text → JSON ourselves using response.content_type
         if "application/json" in response.content_type:
@@ -301,6 +309,11 @@ class Agent:
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict[str, Any]:
+        """Return a dict with task counts for each category:
+            - total completed tasks
+            - total failed tasks
+            - number of tasks currently in processing
+        """
         return {
             "agent_id":        self.agent_id,
             "tasks_completed": self.tasks_completed,
