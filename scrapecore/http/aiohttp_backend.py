@@ -111,6 +111,7 @@ class AiohttpBackend:
                     status=response.status,
                     content_type=content_type,
                     text=text,
+                    headers=dict(response.headers)
                 )
 
         except aiohttp.ClientError as e:
