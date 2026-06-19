@@ -8,8 +8,8 @@ import time
 from typing import Any, Callable, Optional
 import redis.asyncio as aioredis
 
-from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError  # ← new
-from scrapecore.http.aiohttp_backend import AiohttpBackend                    # ← new
+from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError
+from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
@@ -19,28 +19,46 @@ from scrapecore.plugins.auth import BaseAuth
 logger = logging.getLogger(__name__)
 ParserFn = Callable[[Any, dict], Any]
 
+# Backoff sequence (seconds) for 429 / 5xx retries within a single task execution.
+# After all attempts exhaust, the failure surfaces to the queue-level retry
+# mechanism (TaskEnvelope.max_retries).
+_HTTP_RETRY_BACKOFF: tuple[int, ...] = (10, 20, 40, 80, 160)
+
 
 class Agent:
     """
     Remote worker process. Polls the task queue and executes scrape tasks.
 
+    One Agent instance corresponds to one account/session. Throughput scaling
+    is achieved by running multiple Agent instances with distinct credentials,
+    not by adding workers within a single instance. The run loop is a single
+    sequential coroutine: claim → rate-limit → execute → push result.
+
     Args:
-        agent_id:            Unique name for this agent instance.
-        redis:               Connected async Redis client.
-        parser_registry:     Dict mapping parser_key strings to callable parsers.
-        namespace:           Must match the namespace used by the coordinator.
-        num_workers:         Number of concurrent worker coroutines.
-        requests_per_second: Rate limit applied per domain across all workers.
-        claim_timeout:       Seconds a worker blocks on an empty queue before looping.
-        heartbeat_interval:  Seconds between heartbeat writes to Redis.
-        task_timeout:        Seconds before a HTTP request is abandoned.
-                             Ignored if a custom http_backend is provided.
-        proxy:               Proxy URL forwarded to every backend request.
-                             Ignored if a custom http_backend is provided.
-        http_backend:        HTTP backend to use for all requests.
-                             Defaults to AiohttpBackend(timeout=task_timeout).
-                             Pass a CurlCffiBackend instance for bot-protected sites.
-        auth_provider:       #TODO: Fill this in
+        agent_id:           Unique name for this agent instance.
+        redis:              Connected async Redis client.
+        parser_registry:    Dict mapping parser_key strings to callable parsers.
+        namespace:          Must match the namespace used by the coordinator.
+        rate_limit_config:  Dict mapping parser_key → requests_per_second.
+                            Each key gets its own independent rate bucket so
+                            pipeline stages with different server-side limits
+                            can be tuned independently.
+                            Example:
+                                {
+                                    "autopiter.parse_searchdetails": 0.15,
+                                    "autopiter.parse_getcosts":      0.03,
+                                    "autopiter.parse_appraise":      0.03,
+                                }
+                            Parser keys absent from this dict fall back to
+                            1.0 RPS, domain-keyed (conservative default).
+        claim_timeout:      Seconds the run loop blocks on an empty queue.
+        heartbeat_interval: Seconds between heartbeat writes to Redis.
+        task_timeout:       Total HTTP timeout in seconds.
+                            Ignored if a custom http_backend is provided.
+        proxy:              Proxy URL forwarded to every backend request.
+                            Ignored if a custom http_backend is provided.
+        http_backend:       HTTP backend. Defaults to AiohttpBackend.
+        auth_provider:      Authentication provider injected before every request.
     """
 
     def __init__(
@@ -49,27 +67,24 @@ class Agent:
         redis: aioredis.Redis,
         parser_registry: dict[str, ParserFn],
         namespace: str = "default",
-        num_workers: int = 2,
-        requests_per_second: float = 1.0,
+        rate_limit_config: dict[str, float] | None = None,
         claim_timeout: float = 5.0,
         heartbeat_interval: float = 10.0,
         task_timeout: int = 30,
         proxy: Optional[str] = None,
         http_backend: Optional[HttpBackend] = None,
-        auth_provider: BaseAuth | None = None
+        auth_provider: BaseAuth | None = None,
     ) -> None:
         self.agent_id = agent_id
         self._redis = redis
         self._registry = parser_registry
         self._namespace = namespace
-        self._num_workers = num_workers
-        self._requests_per_second = requests_per_second
+        self._rate_limit_config: dict[str, float] = rate_limit_config or {}
         self._claim_timeout = claim_timeout
         self._heartbeat_interval = heartbeat_interval
         self._task_timeout = task_timeout
         self._proxy = proxy
 
-        # Defaults to AiohttpBackend. Override with curl_cffi available.
         self._backend: HttpBackend = (
             http_backend if http_backend is not None
             else AiohttpBackend(timeout=task_timeout)
@@ -80,18 +95,14 @@ class Agent:
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
 
-        self._active_tasks: set[str] = set()
         self._stop_event = asyncio.Event()
 
         self._rate_lock: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}
-        self._min_delay = 1.0 / (requests_per_second / num_workers)
 
         self.tasks_completed = 0
         self.tasks_failed = 0
 
-        # Per-parser_key request counters, used to correlate 429s with
-        # cumulative call counts/elapsed time rather than wall-clock guesses.
         self._stage_counts: dict[str, int] = {}
         self._stage_started_at: Optional[float] = None
 
@@ -99,11 +110,10 @@ class Agent:
 
     async def start(self) -> None:
         """Start the agent. Blocks until stop() is called."""
-        logger.info(f"Agent {self.agent_id!r} starting ({self._num_workers} workers)")
+        logger.info(f"Agent {self.agent_id!r} starting")
         try:
             async with asyncio.TaskGroup() as tg:
-                for i in range(self._num_workers):
-                    tg.create_task(self._worker_loop(worker_index=i))
+                tg.create_task(self._run_loop())
                 tg.create_task(self._heartbeat_loop())
         finally:
             await self._backend.close()
@@ -114,25 +124,33 @@ class Agent:
         logger.info(f"Agent {self.agent_id!r} stop requested")
         self._stop_event.set()
 
-    # ── Worker loop ───────────────────────────────────────────────────────────
+    # ── Run loop ──────────────────────────────────────────────────────────────
 
-    async def _worker_loop(self, worker_index: int) -> None:
-        worker_id = f"{self.agent_id}:worker-{worker_index}"
-        logger.debug(f"Worker {worker_id} started")
+    async def _run_loop(self) -> None:
+        """
+        Single sequential execution loop: claim → execute → push.
 
-        while not self._stop_event.is_set() or self._active_tasks:
+        One task is in flight at a time per agent. Multiple accounts →
+        multiple agents → multiple parallel executions, each with its own
+        session and rate limiter state.
+        """
+        logger.debug(f"Agent {self.agent_id!r} run loop started")
+
+        while not self._stop_event.is_set():
             claimed = await self._task_queue.claim(timeout=self._claim_timeout)
             if claimed is None:
                 continue
 
             task_id, raw_payload = claimed
             envelope = TaskEnvelope.from_dict(raw_payload)
-            self._active_tasks.add(task_id)
 
             try:
                 result = await self._execute(envelope)
             except Exception as e:
-                logger.error(f"Unhandled error in worker {worker_id}: {e}", exc_info=True)
+                logger.error(
+                    f"Unhandled error in agent {self.agent_id!r}: {e}",
+                    exc_info=True,
+                )
                 result = ResultEnvelope.failure(
                     task_id=envelope.task_id,
                     job_id=envelope.job_id,
@@ -158,23 +176,24 @@ class Agent:
                     await self._task_queue.reject(task_id, retried.to_dict(), retried.priority)
                 self.tasks_failed += 1
 
-            self._active_tasks.discard(task_id)
-
-        logger.debug(f"Worker {worker_id} exited")
+        logger.debug(f"Agent {self.agent_id!r} run loop exited")
 
     # ── Task execution ────────────────────────────────────────────────────────
 
     async def _execute(self, envelope: TaskEnvelope) -> ResultEnvelope:
         """
-        Resolve parser -> make HTTP request -> call parser -> return result.
+        Resolve parser → rate-limit → HTTP (with backoff retry) → parse → return.
+
+        Auth headers are re-applied on every retry attempt so a session refresh
+        that fires between attempts is reflected immediately.
         """
-        payload  = envelope.payload
-        url      = payload["url"]
-        method   = payload.get("method", "GET")
-        headers  = dict(payload.get("headers", {}))
-        params   = payload.get("params")
-        body     = payload.get("body")
-        metadata = payload.get("metadata", {})
+        payload      = envelope.payload
+        url          = payload["url"]
+        method       = payload.get("method", "GET")
+        task_headers = dict(payload.get("headers", {}))
+        params       = payload.get("params")
+        body         = payload.get("body")
+        metadata     = payload.get("metadata", {})
 
         parser_fn = self._registry.get(envelope.parser_key)
         if parser_fn is None:
@@ -183,12 +202,12 @@ class Agent:
                 f"Registered: {list(self._registry.keys())}"
             )
 
-        await self._rate_limit(url)
+        await self._rate_limit(url, envelope.parser_key)
 
         if self._stage_started_at is None:
             self._stage_started_at = time.monotonic()
         self._stage_counts[envelope.parser_key] = (
-                self._stage_counts.get(envelope.parser_key, 0) + 1
+            self._stage_counts.get(envelope.parser_key, 0) + 1
         )
         elapsed = time.monotonic() - self._stage_started_at
         if self._stage_counts[envelope.parser_key] % 25 == 0:
@@ -197,50 +216,49 @@ class Agent:
                 f"counts={dict(self._stage_counts)}"
             )
 
-        try:
-            if self._auth_provider:
-                headers = await self._auth_provider.prepare_request(
-                    headers,
-                    url,
+        # HTTP request with per-attempt auth refresh and backoff on 429 / 5xx.
+        # Non-retryable status codes (other 4xx) raise immediately.
+        response = None
+        for attempt, backoff_secs in enumerate(_HTTP_RETRY_BACKOFF):
+            request_headers = dict(task_headers)  # fresh copy — auth may have changed
+            try:
+                if self._auth_provider:
+                    request_headers = await self._auth_provider.prepare_request(
+                        request_headers, url
+                    )
+                response = await self._backend.request(
+                    method, url,
+                    headers=request_headers,
+                    params=params,
+                    body=body,
+                    proxy=self._proxy,
                 )
-            response = await self._backend.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                body=body,
-                proxy=self._proxy,
-            )
-        except HttpBackendError as e:
-            if self._auth_provider:
-                await self._auth_provider.handle_response(
-                    e.status,
-                    e.headers,
-                    url,
-                )
-            if e.status == 429:
-                logger.warning(
-                    f"429 from {url} (parser={envelope.parser_key}) after "
-                    f"{self._stage_counts[envelope.parser_key]} calls to this "
-                    f"stage, {elapsed:.1f}s since first request — "
-                    f"headers={e.headers} body={e.message[:300]!r}"
-                )
-                await asyncio.sleep(60)
-            raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
+                if self._auth_provider:
+                    await self._auth_provider.handle_response(
+                        response.status, response.headers, url
+                    )
+                break  # success — exit retry loop
 
-        except NetworkError as e:
-            raise RuntimeError(str(e))
+            except HttpBackendError as e:
+                if self._auth_provider:
+                    await self._auth_provider.handle_response(e.status, e.headers, url)
+                if e.status == 429 or e.status >= 500:
+                    if attempt == len(_HTTP_RETRY_BACKOFF) - 1:
+                        raise RuntimeError(
+                            f"HTTP {e.status} after {len(_HTTP_RETRY_BACKOFF)} retries "
+                            f"(parser={envelope.parser_key}): {e.url}"
+                        )
+                    logger.warning(
+                        f"HTTP {e.status} — attempt {attempt + 1}/{len(_HTTP_RETRY_BACKOFF)} "
+                        f"(parser={envelope.parser_key}) — retrying in {backoff_secs}s"
+                    )
+                    await asyncio.sleep(backoff_secs)
+                else:
+                    raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
 
-        else:
-            # Successful response hook
-            if self._auth_provider:
-                await self._auth_provider.handle_response(
-                    response.status,
-                    response.headers,
-                    url
-                )
+            except NetworkError as e:
+                raise RuntimeError(str(e))
 
-        # ← updated: parse text → JSON ourselves using response.content_type
         if "application/json" in response.content_type:
             raw = json.loads(response.text)
         else:
@@ -272,19 +290,32 @@ class Agent:
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
 
-    async def _rate_limit(self, url: str) -> None:
+    async def _rate_limit(self, url: str, parser_key: str = "") -> None:
+        """
+        Enforce per-parser-key rate limiting.
+
+        Each parser key in rate_limit_config gets its own Lock and timestamp,
+        so searchdetails (0.15 RPS) and appraise (0.03 RPS) run against
+        completely independent buckets and do not block each other.
+        """
         from urllib.parse import urlparse
-        domain = urlparse(url).netloc
 
-        if domain not in self._rate_lock:
-            self._rate_lock[domain] = asyncio.Lock()
+        if parser_key and parser_key in self._rate_limit_config:
+            bucket    = parser_key
+            min_delay = 1.0 / self._rate_limit_config[parser_key]
+        else:
+            bucket    = urlparse(url).netloc
+            min_delay = 1.0  # conservative fallback for unconfigured keys
 
-        async with self._rate_lock[domain]:
+        if bucket not in self._rate_lock:
+            self._rate_lock[bucket] = asyncio.Lock()
+
+        async with self._rate_lock[bucket]:
             now  = time.monotonic()
-            wait = self._min_delay - (now - self._last_request.get(domain, 0.0))
+            wait = min_delay - (now - self._last_request.get(bucket, 0.0))
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last_request[domain] = time.monotonic()
+            self._last_request[bucket] = time.monotonic()
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
@@ -309,22 +340,15 @@ class Agent:
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict[str, Any]:
-        """Return a dict with task counts for each category:
-            - total completed tasks
-            - total failed tasks
-            - number of tasks currently in processing
-        """
         return {
             "agent_id":        self.agent_id,
             "tasks_completed": self.tasks_completed,
             "tasks_failed":    self.tasks_failed,
-            "active_tasks":    len(self._active_tasks),
         }
 
     def __repr__(self) -> str:
         return (
             f"Agent(id={self.agent_id!r}, "
-            f"workers={self._num_workers}, "
             f"completed={self.tasks_completed}, "
             f"failed={self.tasks_failed})"
         )
