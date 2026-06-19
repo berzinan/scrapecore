@@ -186,6 +186,12 @@ class Agent:
 
         Auth headers are re-applied on every retry attempt so a session refresh
         that fires between attempts is reflected immediately.
+
+        A background task renews this task's claim in Redis every 20s for as
+        long as execution is in flight (including HTTP backoff sleeps), so the
+        coordinator's stale-task recovery doesn't mistake a slow-but-alive
+        execution for a dead agent. Cancelled in `finally` regardless of how
+        this method exits.
         """
         payload      = envelope.payload
         url          = payload["url"]
@@ -202,91 +208,104 @@ class Agent:
                 f"Registered: {list(self._registry.keys())}"
             )
 
-        await self._rate_limit(url, envelope.parser_key)
+        async def _renew_loop() -> None:
+            while True:
+                await asyncio.sleep(20)
+                await self._task_queue.renew_claim(envelope.task_id)
 
-        if self._stage_started_at is None:
-            self._stage_started_at = time.monotonic()
-        self._stage_counts[envelope.parser_key] = (
-            self._stage_counts.get(envelope.parser_key, 0) + 1
-        )
-        elapsed = time.monotonic() - self._stage_started_at
-        if self._stage_counts[envelope.parser_key] % 25 == 0:
-            logger.info(
-                f"[stage_stats] elapsed={elapsed:6.1f}s "
-                f"counts={dict(self._stage_counts)}"
+        renew_task = asyncio.create_task(_renew_loop())
+        try:
+            await self._rate_limit(url, envelope.parser_key)
+
+            if self._stage_started_at is None:
+                self._stage_started_at = time.monotonic()
+            self._stage_counts[envelope.parser_key] = (
+                self._stage_counts.get(envelope.parser_key, 0) + 1
             )
-
-        # HTTP request with per-attempt auth refresh and backoff on 429 / 5xx.
-        # Non-retryable status codes (other 4xx) raise immediately.
-        response = None
-        for attempt, backoff_secs in enumerate(_HTTP_RETRY_BACKOFF):
-            request_headers = dict(task_headers)  # fresh copy — auth may have changed
-            try:
-                if self._auth_provider:
-                    request_headers = await self._auth_provider.prepare_request(
-                        request_headers, url
-                    )
-                response = await self._backend.request(
-                    method, url,
-                    headers=request_headers,
-                    params=params,
-                    body=body,
-                    proxy=self._proxy,
+            elapsed = time.monotonic() - self._stage_started_at
+            if self._stage_counts[envelope.parser_key] % 25 == 0:
+                logger.info(
+                    f"[stage_stats] elapsed={elapsed:6.1f}s "
+                    f"counts={dict(self._stage_counts)}"
                 )
-                if self._auth_provider:
-                    await self._auth_provider.handle_response(
-                        response.status, response.headers, url
-                    )
-                break  # success — exit retry loop
 
-            except HttpBackendError as e:
-                if self._auth_provider:
-                    await self._auth_provider.handle_response(e.status, e.headers, url)
-                if e.status == 429 or e.status >= 500:
-                    if attempt == len(_HTTP_RETRY_BACKOFF) - 1:
-                        raise RuntimeError(
-                            f"HTTP {e.status} after {len(_HTTP_RETRY_BACKOFF)} retries "
-                            f"(parser={envelope.parser_key}): {e.url}"
+            # HTTP request with per-attempt auth refresh and backoff on 429 / 5xx.
+            # Non-retryable status codes (other 4xx) raise immediately.
+            response = None
+            for attempt, backoff_secs in enumerate(_HTTP_RETRY_BACKOFF):
+                request_headers = dict(task_headers)  # fresh copy — auth may have changed
+                try:
+                    if self._auth_provider:
+                        request_headers = await self._auth_provider.prepare_request(
+                            request_headers, url
                         )
-                    logger.warning(
-                        f"HTTP {e.status} — attempt {attempt + 1}/{len(_HTTP_RETRY_BACKOFF)} "
-                        f"(parser={envelope.parser_key}) — retrying in {backoff_secs}s"
+                    response = await self._backend.request(
+                        method, url,
+                        headers=request_headers,
+                        params=params,
+                        body=body,
+                        proxy=self._proxy,
                     )
-                    await asyncio.sleep(backoff_secs)
-                else:
-                    raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
+                    if self._auth_provider:
+                        await self._auth_provider.handle_response(
+                            response.status, response.headers, url
+                        )
+                    break  # success — exit retry loop
 
-            except NetworkError as e:
-                raise RuntimeError(str(e))
+                except HttpBackendError as e:
+                    if self._auth_provider:
+                        await self._auth_provider.handle_response(e.status, e.headers, url)
+                    if e.status == 429 or e.status >= 500:
+                        if attempt == len(_HTTP_RETRY_BACKOFF) - 1:
+                            raise RuntimeError(
+                                f"HTTP {e.status} after {len(_HTTP_RETRY_BACKOFF)} retries "
+                                f"(parser={envelope.parser_key}): {e.url}"
+                            )
+                        logger.warning(
+                            f"HTTP {e.status} — attempt {attempt + 1}/{len(_HTTP_RETRY_BACKOFF)} "
+                            f"(parser={envelope.parser_key}) — retrying in {backoff_secs}s"
+                        )
+                        await asyncio.sleep(backoff_secs)
+                    else:
+                        raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
 
-        if "application/json" in response.content_type:
-            raw = json.loads(response.text)
-        else:
-            raw = response.text
+                except NetworkError as e:
+                    raise RuntimeError(str(e))
 
-        loop = asyncio.get_running_loop()
-        if asyncio.iscoroutinefunction(parser_fn):
-            parsed = await parser_fn(raw, metadata)
-        else:
-            parsed = await loop.run_in_executor(None, parser_fn, raw, metadata)
+            if "application/json" in response.content_type:
+                raw = json.loads(response.text)
+            else:
+                raw = response.text
 
-        if not isinstance(parsed, dict):
-            raise TypeError(
-                f"Parser {envelope.parser_key!r} must return a dict, "
-                f"got {type(parsed).__name__}"
+            loop = asyncio.get_running_loop()
+            if asyncio.iscoroutinefunction(parser_fn):
+                parsed = await parser_fn(raw, metadata)
+            else:
+                parsed = await loop.run_in_executor(None, parser_fn, raw, metadata)
+
+            if not isinstance(parsed, dict):
+                raise TypeError(
+                    f"Parser {envelope.parser_key!r} must return a dict, "
+                    f"got {type(parsed).__name__}"
+                )
+
+            stage_output = parsed.pop("__stage_output__", None)
+
+            return ResultEnvelope.success(
+                task_id=envelope.task_id,
+                job_id=envelope.job_id,
+                agent_id=self.agent_id,
+                retry_count=envelope.retry_count,
+                max_retries=envelope.max_retries,
+                output=parsed,
+                stage_output=stage_output,
             )
-
-        stage_output = parsed.pop("__stage_output__", None)
-
-        return ResultEnvelope.success(
-            task_id=envelope.task_id,
-            job_id=envelope.job_id,
-            agent_id=self.agent_id,
-            retry_count=envelope.retry_count,
-            max_retries=envelope.max_retries,
-            output=parsed,
-            stage_output=stage_output,
-        )
+        finally:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
 

@@ -164,6 +164,19 @@ class TaskQueue:
         logger.debug(f"[{self._ns}] Claimed task {task_id}")
         return task_id, payload
 
+    async def renew_claim(self, task_id: str) -> None:
+        """
+        Refresh claimed_at for a task still being actively worked.
+
+        Called periodically by an agent while a task is in flight (e.g.
+        during HTTP backoff sleep) so recover_stale() does not mistake a
+        slow-but-alive execution for a dead one.
+        """
+        await self._redis.hset(
+            self._payload_key(task_id),
+            mapping={"claimed_at": str(time.time())}
+        )
+
     async def acknowledge(self, task_id: str) -> None:
         """
         Mark a task as successfully completed.

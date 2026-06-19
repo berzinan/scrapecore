@@ -76,9 +76,15 @@ class JobStoreAdapter:
             self._store[job_id]["status"] = "running"
 
     async def mark_completed(self, job_id: str, results: list[dict]) -> None:
-        if job_id in self._store:
-            self._store[job_id]["status"] = "completed"
-            self._store[job_id]["results"] = results
+        existing = await self.get(job_id)
+        if existing is not None and existing.get("status") in ("completed", "failed", "cancelled"):
+            logger.warning(
+                f"mark_completed called for job {job_id} which is already "
+                f"'{existing['status']}' - ignoring to avoid overwriting final results."
+            )
+            return
+        self._store[job_id]["status"] = "completed"
+        self._store[job_id]["results"] = results
 
     async def mark_failed(self, job_id: str, error: str) -> None:
         if job_id in self._store:
@@ -118,12 +124,24 @@ class _JobTracker:
         if job_id not in self._results:
             self._results[job_id] = []
 
+    def is_tracked(self, job_id: str) -> bool:
+        """True until cleanup() runs for this job_id. Callers MUST check
+        this before record_result()/decrement(). A result arriving for an
+        untracked job_id means the job was already finalised — almost
+        always a duplicate task execution from stale-task recovery racing
+        a slow-but-alive agent — and must be dropped, not re-finalised."""
+        return job_id in self._pending
+
     def record_result(self, job_id: str, output: dict) -> None:
         self._results.setdefault(job_id, []).append(output)
 
-    def decrement(self, job_id: str) -> int:
-        """Decrement outstanding count. Returns new count."""
-        count = max(0, self._pending.get(job_id, 1) - 1)
+    def decrement(self, job_id: str) -> Optional[int]:
+        """Decrement outstanding count. Returns new count, or None if
+        job_id is not currently tracked. Callers must check is_tracked()
+        first; None here is a backstop, not the primary guard."""
+        if job_id not in self._pending:
+            return None
+        count = max(0, self._pending[job_id] - 1)
         self._pending[job_id] = count
         return count
 
@@ -315,11 +333,28 @@ class Coordinator:
                         f"— will retry"
                     )
 
+
                 elif result.status == "exhausted":
+
                     logger.error(
+
                         f"Task {result.task_id} exhausted retries: {result.error}"
+
                     )
+
+                    if not self._tracker.is_tracked(job_id):
+                        logger.warning(
+
+                            f"Dropping exhausted-retry result for task "
+
+                            f"{result.task_id}: job {job_id} already finalised."
+
+                        )
+
+                        continue
+
                     remaining = self._tracker.decrement(job_id)
+
                     if remaining == 0:
                         await self._finalise_job(job_id)
 
@@ -329,6 +364,16 @@ class Coordinator:
     async def _handle_completed(self, result: ResultEnvelope) -> None:
         """Process a successfully completed task result."""
         job_id = result.job_id
+
+        if not self._tracker.is_tracked(job_id):
+            logger.warning(
+                f"Dropping result for task {result.task_id}: job {job_id} "
+                f"is already finalised. This is almost always a duplicate "
+                f"task execution from stale-task recovery racing a slow "
+                f"(not dead) agent — see COORDINATOR_STALE. No job state "
+                f"was modified."
+            )
+            return
 
         # Stage result — spawn follow-up tasks
         if result.stage_output is not None:
@@ -359,6 +404,13 @@ class Coordinator:
             self._tracker.record_result(job_id, result.output)
 
         remaining = self._tracker.decrement(job_id)
+        if remaining is None:
+            logger.warning(
+                f"Job {job_id} finalised mid-handling for task "
+                f"{result.task_id} — dropping without re-finalising."
+            )
+            return
+
         logger.info(
             f"Task {result.task_id} completed. "
             f"Job {job_id}: {remaining} task(s) remaining"
