@@ -58,47 +58,38 @@ class JobStoreAdapter:
     """
     Narrow interface between the coordinator and the job store.
 
-    The coordinator calls these methods to read and update job state.
-    The default implementation is an in-memory dict — the same structure
-    used by the existing FastAPI job store. Override for persistence.
-
-    Job record dict shape (minimum required by coordinator):
-        {
-            "job_id":  str,
-            "status":  "pending" | "running" | "completed" | "failed" | "cancelled",
-            "results": list[dict] | None,
-            "error":   str | None,
-        }
+    Every method is async even on this in-memory default implementation,
+    where nothing actually waits on I/O. This keeps the calling convention
+    in Coordinator identical regardless of backend — a Redis-backed
+    subclass needs `await` on real network calls; this one just returns
+    immediately. See RedisJobStoreAdapter in the consumer project for the
+    backend that actually needs the async-ness.
     """
-
     def __init__(self, store: dict[str, dict[str, Any]]) -> None:
         self._store = store
 
-    def get_pending_jobs(self) -> list[dict[str, Any]]:
-        return [
-            job for job in self._store.values()
-            if job["status"] == "pending"
-        ]
+    async def get_pending_jobs(self) -> list[dict[str, Any]]:
+        return [job for job in self._store.values() if job["status"] == "pending"]
 
-    def mark_running(self, job_id: str) -> None:
+    async def mark_running(self, job_id: str) -> None:
         if job_id in self._store:
             self._store[job_id]["status"] = "running"
 
-    def mark_completed(self, job_id: str, results: list[dict]) -> None:
+    async def mark_completed(self, job_id: str, results: list[dict]) -> None:
         if job_id in self._store:
             self._store[job_id]["status"] = "completed"
             self._store[job_id]["results"] = results
 
-    def mark_failed(self, job_id: str, error: str) -> None:
+    async def mark_failed(self, job_id: str, error: str) -> None:
         if job_id in self._store:
             self._store[job_id]["status"] = "failed"
             self._store[job_id]["error"] = error
 
-    def is_cancelled(self, job_id: str) -> bool:
+    async def is_cancelled(self, job_id: str) -> bool:
         job = self._store.get(job_id)
         return job is not None and job["status"] == "cancelled"
 
-    def get(self, job_id: str) -> Optional[dict[str, Any]]:
+    async def get(self, job_id: str) -> Optional[dict[str, Any]]:
         return self._store.get(job_id)
 
 
@@ -233,11 +224,11 @@ class Coordinator:
         """
         while not self._stop_event.is_set():
             try:
-                for job in self._store.get_pending_jobs():
+                for job in await self._store.get_pending_jobs():
                     job_id = job["job_id"]
                     if job_id in self._dispatched:
                         continue
-                    if self._store.is_cancelled(job_id):
+                    if await self._store.is_cancelled(job_id):
                         await self._redis.sadd(
                             f"scrapecore:{self._namespace}:cancelled_jobs", job_id
                         )
@@ -251,13 +242,13 @@ class Coordinator:
                         tasks = self._task_factory(job)
                     except Exception as e:
                         logger.error(f"task_factory failed for job {job_id}: {e}")
-                        self._store.mark_failed(job_id, f"task_factory error: {e}")
+                        await self._store.mark_failed(job_id, f"task_factory error: {e}")
                         self._dispatched.add(job_id)
                         continue
 
                     if not tasks:
                         logger.warning(f"task_factory returned no tasks for job {job_id}")
-                        self._store.mark_failed(job_id, "No tasks produced by task_factory")
+                        await self._store.mark_failed(job_id, "No tasks produced by task_factory")
                         self._dispatched.add(job_id)
                         continue
 
@@ -269,7 +260,7 @@ class Coordinator:
                             priority=envelope.priority,
                         )
 
-                    self._store.mark_running(job_id)
+                    await self._store.mark_running(job_id)
                     self._dispatched.add(job_id)
                     logger.info(
                         f"Job {job_id} dispatched: {len(tasks)} task(s) enqueued"
@@ -308,7 +299,7 @@ class Coordinator:
 
                 job_id = result.job_id
 
-                if self._store.is_cancelled(job_id):
+                if await self._store.is_cancelled(job_id):
                     logger.info(f"Dropping result for cancelled job {job_id}")
                     continue
 
@@ -382,10 +373,10 @@ class Coordinator:
         self._tracker.cleanup(job_id)
 
         if results:
-            self._store.mark_completed(job_id, results)
+            await self._store.mark_completed(job_id, results)
             logger.info(f"Job {job_id} completed with {len(results)} result(s)")
         else:
-            self._store.mark_failed(job_id, "All tasks failed or produced no output")
+            await self._store.mark_failed(job_id, "All tasks failed or produced no output")
             logger.error(f"Job {job_id} failed — no results collected")
 
     # ── Loop 3: recovery ──────────────────────────────────────────────────────
