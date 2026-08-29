@@ -22,7 +22,7 @@ will pick tasks up, execute them, and push results back.
 `scrapecore` is not yet on PyPI. Install from source:
 
 ```bash
-git clone https://github.com/exec666/scrapecore.git
+git clone https://github.com/berzinan/scrapecore.git
 cd scrapecore
 pip install -e .
 ```
