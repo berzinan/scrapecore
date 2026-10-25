@@ -154,6 +154,30 @@ async def test_dispatch_loop_skips_cancelled_jobs(fake_redis, namespace):
 
     assert calls == []
 
+async def test_cancel_job_marks_cancelled_and_purges_pending(fake_redis, namespace):
+    """cancel_job publishes to cancelled_jobs before purging pending tasks,
+    so agents see the cancel flag before the purge window closes."""
+    store = {"job-1": _pending_job("job-1"), "job-2": _pending_job("job-2")}
+    coordinator = _make_coordinator(fake_redis, namespace, store, task_factory=lambda j: [])
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+
+    # Two tasks for job-1, one for job-2.
+    for tid, job_id in [("t1", "job-1"), ("t2", "job-1"), ("t3", "job-2")]:
+        await task_queue.push(
+            tid,
+            TaskEnvelope(job_id=job_id, task_id=tid, parser_key="p", payload={}).to_dict(),
+            priority=0,
+        )
+    assert await task_queue.pending_count() == 3
+
+    removed = await coordinator.cancel_job("job-1")
+
+    cancelled_key = f"scrapecore:{namespace}:cancelled_jobs"
+    assert removed == 2
+    assert await fake_redis.sismember(cancelled_key, "job-1") == 1
+    assert await fake_redis.sismember(cancelled_key, "job-2") == 0
+    assert await task_queue.pending_count() == 1
+
 
 async def test_dispatch_loop_marks_failed_when_factory_returns_empty(fake_redis, namespace):
     store = {"job-1": _pending_job()}

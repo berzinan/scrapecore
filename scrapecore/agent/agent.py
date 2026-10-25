@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable, Optional
 import redis.asyncio as aioredis
 
-from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError
+from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError, ScrapeFailedError
 from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
@@ -146,7 +146,22 @@ class Agent:
 
             try:
                 result = await self._execute(envelope)
+            except ScrapeFailedError as e:
+                # Expected task failure - no "Unhandled" prefix.
+                logger.warning(
+                    f"Task {envelope.task_id} failed in agent "
+                    f"{self.agent_id!r}: {e}"
+                )
+                result = ResultEnvelope.failure(
+                    task_id=envelope.task_id,
+                    job_id=envelope.job_id,
+                    agent_id=self.agent_id,
+                    retry_count=envelope.retry_count,
+                    max_retries=envelope.max_retries,
+                    error=str(e),
+                )
             except Exception as e:
+                # Genuinely unexpected - parser bug, schema mismatch, etc.
                 logger.error(
                     f"Unhandled error in agent {self.agent_id!r}: {e}",
                     exc_info=True,
@@ -159,7 +174,7 @@ class Agent:
                     max_retries=envelope.max_retries,
                     error=f"Unhandled: {type(e).__name__}: {e}",
                 )
-
+        
             await self._result_queue.push(result)
 
             if result.status == "completed":
@@ -257,7 +272,7 @@ class Agent:
                         await self._auth_provider.handle_response(e.status, e.headers, url)
                     if e.status == 429 or e.status >= 500:
                         if attempt == len(_HTTP_RETRY_BACKOFF) - 1:
-                            raise RuntimeError(
+                            raise ScrapeFailedError(
                                 f"HTTP {e.status} after {len(_HTTP_RETRY_BACKOFF)} retries "
                                 f"(parser={envelope.parser_key}): {e.url}"
                             )
@@ -267,10 +282,10 @@ class Agent:
                         )
                         await asyncio.sleep(backoff_secs)
                     else:
-                        raise RuntimeError(f"HTTP {e.status} from {e.url}: {e.message}")
+                        raise ScrapeFailedError(f"HTTP {e.status} from {e.url}: {e.message}")
 
                 except NetworkError as e:
-                    raise RuntimeError(str(e))
+                    raise ScrapeFailedError(str(e))
 
             if "application/json" in response.content_type:
                 raw = json.loads(response.text)

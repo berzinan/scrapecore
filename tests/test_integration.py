@@ -63,8 +63,6 @@ async def test_full_pipeline_single_stage():
         redis=redis,
         parser_registry={"site.parse": parser},
         namespace=namespace,
-        num_workers=1,
-        requests_per_second=100.0,
         claim_timeout=0.5,
         heartbeat_interval=1.0,
     )

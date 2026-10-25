@@ -117,7 +117,7 @@ Run one of these on every worker machine.
 import asyncio
 from scrapecore.queue.redis_client import create_redis_client
 from scrapecore.agent.agent import Agent
-from scrapecore.plugins.base import ParserRegistry
+from scrapecore.plugins import ParserRegistry
 from myscraper.parsers import ItemParser
 
 
@@ -132,8 +132,7 @@ async def main():
         redis=redis,
         parser_registry=registry.as_callable_dict(),
         namespace="default",
-        num_workers=4,
-        requests_per_second=2.0,
+        rate_limit_config={"mysite.parse_item": 2.0},
     )
     await agent.start()
 
@@ -149,7 +148,7 @@ Run this on your server, alongside Redis and whatever API submits jobs.
 import asyncio
 from scrapecore.queue.redis_client import create_redis_client
 from scrapecore.coordinator.coordinator import Coordinator, JobStoreAdapter
-from scrapecore.plugins.base import ParserRegistry
+from scrapecore.plugins import ParserRegistry
 from myscraper.parsers import ItemParser
 
 # Replace with your real store (Redis hash, Postgres table, etc.)
@@ -287,6 +286,8 @@ When the counter reaches zero, the job is finalised with whatever non-empty
 
 ## Retries and failures
 
+Retries happen at 2 levels. Within a single execution, agent retries HTTP 429 and 5xx responses in-place: up-to 5 attempts, sleeping 10s, 20s, 40s, and 80s between them. These in-place retries do not consume `retry_count`, and the agent renews its claim on thetask every 20s while it waits, so stale-task recovery does not mistake it for a dead agent. Other 4xx statuses, network errors and parser exceptions skip this and fail execution immediately. Only then does the queue-level retry below apply.
+
 Every `TaskEnvelope` carries `retry_count` and `max_retries` (default 3). On
 failure, the agent re-enqueues the task with `retry_count + 1` and pushes a
 `ResultEnvelope(status="failed")`. When `retry_count == max_retries`, the
@@ -309,9 +310,7 @@ another agent to pick up.
 
 Two layers, used together:
 
-**Local (per-agent, always on).** Set `requests_per_second` on the `Agent`
-constructor. The agent enforces a minimum delay between requests to the
-same domain across all its workers.
+**Local (per-agent, always on).** Pass `rate_limit_config` to the `Agent` constructor: a dict mapping `parser_key` to requests per second. Each key gets its own independent bucket, so pipeline stages with different server-side limits can be tuned separately. Parser keys not listed fall back to 1 rps per domain. An agent runs 1 task at a time, so the limit applies to that single loop.
 
 **Global (across all agents, optional).** Use `DistributedRateLimiter` plus
 a `RateLimitConfig` for sites with a fleet-wide cap regardless of source
@@ -349,16 +348,16 @@ The Redis client factory reads these:
 
 The default `JobStoreAdapter` wraps an in-memory dict. For anything beyond
 prototyping, subclass it and back it with the database of your choice
-(Postgres, Redis hashes, DynamoDB, etc.) — keep the same method shape:
+(Postgres, Redis hashes, DynamoDB, etc.) — keep the same method shape (all methods are async):
 
 ```python
 class JobStoreAdapter:
-    def get_pending_jobs(self) -> list[dict]: ...
-    def mark_running(self, job_id: str) -> None: ...
-    def mark_completed(self, job_id: str, results: list[dict]) -> None: ...
-    def mark_failed(self, job_id: str, error: str) -> None: ...
-    def is_cancelled(self, job_id: str) -> bool: ...
-    def get(self, job_id: str) -> dict | None: ...
+    async def get_pending_jobs(self) -> list[dict]: ...
+    async def mark_running(self, job_id: str) -> None: ...
+    async def mark_completed(self, job_id: str, results: list[dict]) -> None: ...
+    async def mark_failed(self, job_id: str, error: str) -> None: ...
+    async def is_cancelled(self, job_id: str) -> bool: ...
+    async def get(self, job_id: str) -> dict | None: ...
 ```
 
 A `JobRecord` must always have at least: `job_id`, `status`, `results`,
@@ -412,9 +411,9 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
               ┌────────────────┼─────────────┼────────────────┐
               │  AGENT (machine-01)          │                │
               │                │             │                │
-              │  Worker 0 ◀────┘             │                │
-              │  Worker 1 ◀────claim()    push(result)        │
-              │  Worker N                    │                │
+              │  run loop ◀────┘             │                │
+              │  claim → rate-limit →     push(result)        │
+              │  execute → push              |                │
               │       │                      │                │
               │  parser_registry             │                │
               │  rate_limiter ───────────────┘                │
@@ -425,7 +424,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | Component               | Role                                                      |
 |-------------------------|-----------------------------------------------------------|
 | `Coordinator`           | Polls job store, dispatches tasks, drains results.        |
-| `Agent`                 | Runs N worker coroutines per machine.                     |
+| `Agent`                 | Sequential claim/execute/push loop. Scale = more Agents.                     |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
 | `ResultQueue`           | Single Redis list of `ResultEnvelope`s.                   |
 | `TaskEnvelope`          | Unit of work. Carries `parser_key` and consumer payload.  |
