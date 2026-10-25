@@ -142,7 +142,7 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
 
     url = "https://example.com/fail"
     envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse"
+        job_id="j", parser_key="site.parse",
         payload={"url": url},
     )
     await _enqueue(fake_redis, namespace, envelope)
@@ -157,7 +157,7 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
 
     result = await result_queue.pop(timeout=1.0)
     assert result is not None
-    assert result.status = "completed"
+    assert result.status == "completed"
     assert result.retry_count == 0
     assert await result_queue.pop(timeout=0.1) is None
 
