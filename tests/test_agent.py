@@ -118,15 +118,23 @@ async def test_http_error_pushes_failed_result_and_retries(fake_redis, namespace
         )
 
     statuses = []
+    errors = []
     while True:
         r = await result_queue.pop(timeout=0.1)
         if r is None:
             break
         statuses.append(r.status)
+        errors.append(r.error or "")
 
     # First N are "failed", final one is "exhausted".
     assert statuses[:-1] == ["failed"] * (len(statuses) - 1)
     assert statuses[-1] == "exhausted"
+
+    # Every failure must be the real HTTP 500, not an unhandled mock/TypeError
+    assert len(errors) == envelope.max_retries + 1
+    for err in errors:
+        assert "HTTP 500" in err, f"expected HTTP 500, got: {err!r}"
+        assert "Unhandled" not in err
 
     # After exhaustion the task is acknowledged, not re-queued.
     assert await task_queue.pending_count() == 0
@@ -149,7 +157,7 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
 
     with aioresponses() as mock:
         mock.get(url, status=500)
-        mock.get(url, status=200)
+        mock.get(url, status=200, payload={"data": "recovered"})
         await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
         calls = mock.requests[("GET", URL(url))]
 
@@ -159,6 +167,7 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
     assert result is not None
     assert result.status == "completed"
     assert result.retry_count == 0
+    assert result.error is None
     assert await result_queue.pop(timeout=0.1) is None
 
     assert agent.tasks_failed == 0
@@ -212,38 +221,6 @@ async def test_parser_exception_produces_failure(fake_redis, namespace):
     assert result is not None
     assert result.status == "exhausted"
     assert "kaboom" in result.error
-
-
-# ── In-place backoff ─────────────────────────────────────────────────────────────
-async def test_failing_task_eventually_recovers(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {"v": 1}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https::example.com/fail"},
-        max_retries=2
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    with aioresponses() as mock:
-        mock.get("https://example.com/fail", status=500, repeat=True)
-        mock.get("https://example.com/fail", status=200, repeat=True)
-        await _run_agent_until(
-            agent,
-            lambda: agent_tasks_failed >= envelope.max_retries + 1,
-            timeout=5.0,
-        )
-    retry_counts = []
-    while True:
-        r = await result_queue.pop(timeout=0.1)
-        if r is None:
-            break
-            retry_counts.append(r.retry_count)
-    assert agent.tasks_failed == 0
 
 # ── Stage output ─────────────────────────────────────────────────────────────
 
