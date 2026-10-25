@@ -4,14 +4,21 @@ import asyncio
 
 import pytest
 from aioresponses import aioresponses
+from yarl import URL
 
 from scrapecore.agent.agent import Agent
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
 
+# ── Fixtures ───────────────────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def fast_http_backoff(monkeypatch):
+    """In-place 429/5xxd retries sleep 10s+; collapse to 2 instant attempts."""
+    monkeypatch.setattr("scrapecore.agent.agent._HTTP_RETRY_BACKOFF", (0, 0))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 async def _enqueue(fake_redis, namespace, envelope: TaskEnvelope) -> None:
     await TaskQueue(fake_redis, namespace=namespace).push(
@@ -36,13 +43,13 @@ async def _run_agent_until(agent: Agent, predicate, timeout: float = 3.0) -> Non
 
 
 def _make_agent(fake_redis, namespace, registry, **kwargs) -> Agent:
+    """Replaces old rps=100.0: effectively no local RL."""
+    kwargs.setdefault("rate_limit_config", {"site.parse": 1000.0})
     return Agent(
         agent_id="test-agent",
         redis=fake_redis,
         parser_registry=registry,
         namespace=namespace,
-        num_workers=1,
-        requests_per_second=100.0,    # effectively disable local rate limit
         claim_timeout=0.1,            # fast shutdown
         heartbeat_interval=1.0,       # >= 1s so int(interval * 3) >= 1
         task_timeout=5,
@@ -103,9 +110,7 @@ async def test_http_error_pushes_failed_result_and_retries(fake_redis, namespace
     await _enqueue(fake_redis, namespace, envelope)
 
     with aioresponses() as mock:
-        # Repeat the same 500 for all attempts.
-        for _ in range(envelope.max_retries + 1):
-            mock.get("https://example.com/fail", status=500)
+        mock.get("https://example.com/fail", status=500, repeat=True)
         await _run_agent_until(
             agent,
             lambda: agent.tasks_failed >= envelope.max_retries + 1,
@@ -124,6 +129,39 @@ async def test_http_error_pushes_failed_result_and_retries(fake_redis, namespace
     assert statuses[-1] == "exhausted"
 
     # After exhaustion the task is acknowledged, not re-queued.
+    assert await task_queue.pending_count() == 0
+    assert await task_queue.processing_count() == 0
+
+async def test_http_failure_recovers_within_single_execution(fake_redis, namespace):
+    def parser(raw, metadata):
+        return {"v": 1}
+    
+    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+
+    url = "https://example.com/fail"
+    envelope = TaskEnvelope(
+        job_id="j", parser_key="site.parse"
+        payload={"url": url},
+    )
+    await _enqueue(fake_redis, namespace, envelope)
+
+    with aioresponses() as mock:
+        mock.get(url, status=500)
+        mock.get(url, status=200)
+        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
+        calls = mock.requests[("GET", URL(url))]
+
+    assert len(calls) == 2
+
+    result = await result_queue.pop(timeout=1.0)
+    assert result is not None
+    assert result.status = "completed"
+    assert result.retry_count == 0
+    assert await result_queue.pop(timeout=0.1) is None
+
+    assert agent.tasks_failed == 0
     assert await task_queue.pending_count() == 0
     assert await task_queue.processing_count() == 0
 
@@ -176,9 +214,8 @@ async def test_parser_exception_produces_failure(fake_redis, namespace):
     assert "kaboom" in result.error
 
 
-# ── Retry count increments ───────────────────────────────────────────────────
-
-async def test_retry_count_increments_on_each_failure(fake_redis, namespace):
+# ── In-place backoff ─────────────────────────────────────────────────────────────
+async def test_failing_task_eventually_recovers(fake_redis, namespace):
     def parser(raw, metadata):
         return {"v": 1}
 
@@ -187,29 +224,26 @@ async def test_retry_count_increments_on_each_failure(fake_redis, namespace):
 
     envelope = TaskEnvelope(
         job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com/x"},
-        max_retries=2,
+        payload={"url": "https::example.com/fail"},
+        max_retries=2
     )
     await _enqueue(fake_redis, namespace, envelope)
 
     with aioresponses() as mock:
-        for _ in range(envelope.max_retries + 1):
-            mock.get("https://example.com/x", status=503)
+        mock.get("https://example.com/fail", status=500, repeat=True)
+        mock.get("https://example.com/fail", status=200, repeat=True)
         await _run_agent_until(
             agent,
-            lambda: agent.tasks_failed >= envelope.max_retries + 1,
+            lambda: agent_tasks_failed >= envelope.max_retries + 1,
             timeout=5.0,
         )
-
     retry_counts = []
     while True:
         r = await result_queue.pop(timeout=0.1)
         if r is None:
             break
-        retry_counts.append(r.retry_count)
-
-    assert retry_counts == [0, 1, 2]
-
+            retry_counts.append(r.retry_count)
+    assert agent.tasks_failed == 0
 
 # ── Stage output ─────────────────────────────────────────────────────────────
 
