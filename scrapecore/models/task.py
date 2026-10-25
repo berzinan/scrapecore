@@ -3,8 +3,6 @@ scrapecore/models/task.py
 
 TaskEnvelope — the unit of work that travels through the queue.
 
-Design principle: the library owns the envelope, the consumer owns the payload.
-
 The envelope carries everything the library needs to route, retry, and track
 a task. The payload is an opaque dict defined entirely by the consumer — the
 library stores and forwards it without inspecting it.
@@ -14,16 +12,16 @@ Example of what an envelope looks like as JSON in Redis:
     {
         "task_id":       "3f7a1b2c-...",
         "job_id":        "9e2d4f1a-...",
-        "parser_key":    "autopiter.parse_appraise",
+        "parser_key":    "mysite.endpoint1",
         "priority":      0,
         "retry_count":   0,
         "max_retries":   3,
         "created_at":    "2026-05-10T14:30:00.123456",
         "payload": {
-            "url":         "https://autopiter.ru/api/...",
+            "url":         "https://mysite.com/api/...",
             "method":      "GET",
             "headers":     {...},
-            "metadata":    {"part_code": "38H5003", "stage": "appraise"}
+            "metadata":    {"field1": "data", "stage": "endpoint1"}
         }
     }
 
@@ -51,7 +49,7 @@ class TaskEnvelope:
         task_id:     Unique ID for this specific task. Auto-generated.
         job_id:      ID of the parent job this task belongs to. Set by coordinator.
         parser_key:  Dotted string identifying the parser function the agent
-                     should call. Example: "autopiter.parse_appraise".
+                     should call. Example: "mysite.endpoint1".
                      The agent resolves this against its local parser registry.
         priority:    Integer. Higher = claimed sooner. Passed through to the queue.
         retry_count: How many times this task has been attempted. Starts at 0.
@@ -76,11 +74,12 @@ class TaskEnvelope:
     def to_dict(self) -> dict[str, Any]:
         """
         Convert to a plain dict suitable for JSON serialization.
-        All values are JSON-safe primitives — no datetime objects, no Enums.
+        All values are JSON-safe primitives.
         """
         return asdict(self)
 
     def to_json(self) -> str:
+        """TODO: Docstring"""
         return json.dumps(self.to_dict())
 
     @classmethod
@@ -95,17 +94,19 @@ class TaskEnvelope:
 
     @classmethod
     def from_json(cls, raw: str) -> TaskEnvelope:
+        """TODO: Docstring"""
         return cls.from_dict(json.loads(raw))
 
     # ── Retry logic ───────────────────────────────────────────────────────────
 
     def should_retry(self) -> bool:
+        """TODO: Docstring"""
         return self.retry_count < self.max_retries
 
     def increment_retry(self) -> TaskEnvelope:
         """
         Return a new envelope with retry_count incremented by one.
-        Envelopes are treated as immutable — we never mutate in place.
+        Envelopes are treated as immutable.
         """
         data = self.to_dict()
         data["retry_count"] += 1

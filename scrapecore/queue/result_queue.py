@@ -62,8 +62,10 @@ class ResultQueue:
             return None
 
     async def length(self) -> int:
+        """TODO: Docstring"""
         return await self._redis.llen(self._key)
 
     async def flush(self) -> None:
+        """TODO: Docstring"""
         await self._redis.delete(self._key)
         logger.warning("[result_queue] Result queue flushed.")

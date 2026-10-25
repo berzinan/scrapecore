@@ -3,7 +3,6 @@ scrapecore/queue/task_queue.py
 
 Reliable task queue backed by two Redis lists.
 
-Concept — the two-list pattern:
 
     PENDING LIST          PROCESSING LIST
     ┌──────────┐          ┌──────────────┐
@@ -13,16 +12,12 @@ Concept — the two-list pattern:
     └──────────┘
 
 When an agent claims a task, it moves atomically from PENDING to PROCESSING.
-"Atomically" means: no other agent can see a state between "in pending" and
-"in processing" — it is in exactly one list at all times, even if the network
-drops mid-operation. This is guaranteed by Redis's BLMOVE command.
 
-If an agent crashes, its task stays in PROCESSING forever — until the
-coordinator's recovery loop detects the stale entry and moves it back to
-PENDING. This is the heartbeat/recovery mechanism we build in a later step.
+If an agent crashes, its task stays in PROCESSING until the coordinator's
+recovery loop detects the stale entry and moves it back to PENDING.
 
-Key naming convention:
-    scrapecore:{namespace}:pending      — waiting to be claimed
+Naming convention:
+    scrapecore:{namespace}:pending     — waiting to be claimed
     scrapecore:{namespace}:processing  — currently held by an agent
     scrapecore:{namespace}:task:{id}   — full task payload stored as a hash
 
@@ -70,6 +65,7 @@ class TaskQueue:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _payload_key(self, task_id: str) -> str:
+        """TODO: Docstring"""
         return self._payload_prefix + task_id
 
     async def _store_payload(self, task_id: str, payload: dict) -> None:
@@ -90,6 +86,7 @@ class TaskQueue:
         return json.loads(raw)
 
     async def _delete_payload(self, task_id: str) -> None:
+        """TODO: Docstring"""
         await self._redis.delete(self._payload_key(task_id))
 
     # ── Producer API ──────────────────────────────────────────────────────────
@@ -99,9 +96,8 @@ class TaskQueue:
         Enqueue a task.
 
         Priority is encoded by pushing high-priority tasks to the front of the
-        list (RPUSH for normal, LPUSH for elevated). This is a simple scheme —
-        a full priority queue would use a Redis sorted set instead. We keep it
-        simple for now and can upgrade later.
+        list (RPUSH for normal, LPUSH for elevated).
+        This is a simple scheme — full priority queue would use a Redis sorted set instead.
 
         :param task_id:  Unique identifier for this task.
         :param payload:  Full task data as a dict. Must be JSON-serializable.
@@ -109,8 +105,6 @@ class TaskQueue:
         """
         await self._store_payload(task_id, payload)
 
-        # claim() pops from the RIGHT end of the list, so high-priority
-        # items must be pushed to the RIGHT to be claimed first.
         if priority > 0:
             await self._redis.rpush(self._pending_key, task_id)
         else:
@@ -126,10 +120,6 @@ class TaskQueue:
 
         Blocks for up to `timeout` seconds if the queue is empty. Returns None
         on timeout — callers should loop and call claim() again.
-
-        The BLMOVE command moves the task_id from the pending list to the
-        processing list in a single atomic operation. No other agent can claim
-        the same task_id.
 
         :param timeout: Seconds to block waiting for a task.
         :return: (task_id, payload) tuple, or None if queue was empty.
@@ -182,7 +172,6 @@ class TaskQueue:
         Mark a task as successfully completed.
 
         Removes it from the processing list and deletes the payload.
-        After this call the task no longer exists in Redis.
 
         :param task_id: The task to remove.
         """
@@ -225,10 +214,9 @@ class TaskQueue:
         """
         Re-enqueue tasks that have been in the processing list too long.
 
-        This is the fault tolerance mechanism. If an agent claims a task and
-        then crashes, the task_id stays in the processing list. This method
-        is called periodically by the coordinator — it checks the claimed_at
-        timestamp for each processing entry and re-enqueues anything older
+        If an agent claims a task and then crashes, the task_id stays in the processing list.
+        This method is called periodically by the coordinator:
+        checks the claimed_at timestamp for each processing entry, re-enqueues anything older
         than stale_after_seconds.
 
         :param stale_after_seconds: Tasks held longer than this are considered lost.
@@ -263,9 +251,11 @@ class TaskQueue:
     # ── Introspection ─────────────────────────────────────────────────────────
 
     async def pending_count(self) -> int:
+        """TODO: Docstring"""
         return await self._redis.llen(self._pending_key)
 
     async def processing_count(self) -> int:
+        """TODO: Docstring"""
         return await self._redis.llen(self._processing_key)
 
     async def flush(self) -> None:

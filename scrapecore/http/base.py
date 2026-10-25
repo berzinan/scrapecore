@@ -27,8 +27,6 @@ class HttpResponse:
 class HttpBackendError(Exception):
     """
     Raised by a backend when the server returns a non-2xx status.
-
-    Replaces aiohttp.ClientResponseError so agent.py stays backend-agnostic.
     """
     def __init__(
         self,
@@ -47,14 +45,13 @@ class HttpBackendError(Exception):
 class NetworkError(Exception):
     """
     Raised by a backend for connection-level failures (timeouts, DNS, etc.).
-
-    Replaces aiohttp.ClientError.
     """
 
 class ScrapeFailedError(Exception):
-    """A task failed in an expected way (HTTP error, network error, retries exhausted).
-       Surfaces to ResultEnvelope.error without 'Unhandled: ' prefix that _run_loop applies
-       to genuinely unexpected exceptions.
+    """
+    A task failed in an expected way (HTTP error, network error, retries exhausted).
+    Surfaces to ResultEnvelope.error without 'Unhandled: ' prefix that _run_loop applies
+    to genuinely unexpected exceptions.
     """
 
 

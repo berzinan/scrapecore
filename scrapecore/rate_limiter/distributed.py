@@ -7,41 +7,20 @@ Two layers of rate limiting exist in the system:
 
     Layer 1 — Local (per-agent, in agent.py)
         Enforces minimum delay between requests to the same domain
-        within a single agent. Fast — no network round trip.
-        This is what prevents a single agent from hammering a site.
+        within a single agent. 
+        Prevents a single agent from hammering a site.
+        Always running.
 
     Layer 2 — Global (this module, coordinator-configured)
         Enforces a maximum request rate across ALL agents combined
         for a given domain. Stored in Redis so every agent sees the
         same counter.
+        Optional.
         Use this when a site has a global rate cap regardless of IP.
-
-The two layers work together:
-    - Layer 1 always runs (built into the agent)
-    - Layer 2 is optional — only needed when you want to cap total
-      throughput across the fleet for a specific domain
-
-How the sliding window works:
-
-    Redis key: scrapecore:ratelimit:{domain}:{window_id}
-    window_id = int(current_unix_time / window_seconds)
-
-    Each key represents one time window (default: 1 second).
-    On each request:
-        1. Compute current window_id
-        2. INCR the counter for that window (atomic)
-        3. SET expiry to 2x window_seconds (auto-cleanup)
-        4. If counter > limit → sleep until next window, then retry
-
-    Because INCR is atomic in Redis, two agents incrementing
-    simultaneously are serialised — one gets count=1, the other
-    gets count=2. No race condition possible.
 
 Lua script:
     The check-and-increment is done in a Lua script so that the
     read (GET) and write (INCR + EXPIRE) happen atomically.
-    Without this, two agents could both read count=4 (limit=5),
-    both decide to proceed, and both increment — overshooting the limit.
 """
 
 from __future__ import annotations
@@ -75,7 +54,7 @@ class DistributedRateLimiter:
 
     Usage on agent side:
         limiter = DistributedRateLimiter(redis, namespace="default")
-        await limiter.acquire("autopiter.ru", limit=2, window_seconds=1.0)
+        await limiter.acquire("mysite.com", limit=2, window_seconds=1.0)
         # proceed with request
 
     Args:
@@ -107,6 +86,7 @@ class DistributedRateLimiter:
         return self._script_sha
 
     def _window_key(self, domain: str, window_id: int) -> str:
+        """TODO: Docstring"""
         return f"scrapecore:{self._namespace}:ratelimit:{domain}:{window_id}"
 
     async def acquire(
@@ -119,7 +99,7 @@ class DistributedRateLimiter:
         Block until a request slot is available for this domain.
 
         Args:
-            domain:         The domain being rate-limited, e.g. "autopiter.ru".
+            domain:         The domain being rate-limited, e.g. "mysite.com".
             limit:          Maximum requests across all agents per window.
             window_seconds: Length of the sliding window in seconds.
         """
@@ -183,8 +163,8 @@ class RateLimitConfig:
 
     Example:
         config = RateLimitConfig(default_limit=5)
-        config.set("autopiter.ru", limit=2, window_seconds=1.0)
-        config.set("autodoc.ru",   limit=1, window_seconds=1.0)
+        config.set("mysite.com", limit=2, window_seconds=1.0)
+        config.set("myothersite.com",   limit=1, window_seconds=1.0)
     """
 
     def __init__(
@@ -197,6 +177,7 @@ class RateLimitConfig:
         self._rules: dict[str, tuple[int, float]] = {}
 
     def set(self, domain: str, limit: int, window_seconds: float = 1.0) -> None:
+        """TODO: Docstring"""
         self._rules[domain] = (limit, window_seconds)
 
     def get(self, domain: str) -> tuple[int, float]:

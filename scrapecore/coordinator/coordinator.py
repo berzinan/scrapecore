@@ -10,8 +10,7 @@ Runs four concurrent loops:
     4. heartbeat_loop   — writes coordinator liveness key to Redis
 
 Consumer integration:
-    The coordinator knows nothing about autopiter, price lists, or any
-    domain concept. It operates entirely on:
+    The coordinator operates entirely on:
         - JobRecord dicts   (provided by the job store adapter)
         - TaskEnvelopes     (built by a consumer-supplied task factory)
         - ResultEnvelopes   (built by agents)
@@ -20,19 +19,16 @@ Consumer integration:
 
     task_factory(job: dict) -> list[TaskEnvelope]
         Given a job record, return the first-stage TaskEnvelopes to enqueue.
-        For autopiter: returns one search TaskEnvelope per part code.
+      
 
     stage_handler(result: ResultEnvelope) -> list[TaskEnvelope] | None
         Given a completed result that contains stage_output, return the
         next-stage TaskEnvelopes to enqueue, or None if this is a final result.
-        For autopiter: reads catalog IDs from stage_output, returns appraise tasks.
         For single-stage sites: always return None.
 
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
-    (JobStoreAdapter defined below) rather than importing the FastAPI job store
-    directly. This keeps the coordinator testable in isolation and lets the
-    consumer swap in a Redis-backed or database-backed store later.
+    (JobStoreAdapter defined below) to keep it testable in isolation.
 """
 
 from __future__ import annotations
@@ -59,23 +55,23 @@ class JobStoreAdapter:
     Narrow interface between the coordinator and the job store.
 
     Every method is async even on this in-memory default implementation,
-    where nothing actually waits on I/O. This keeps the calling convention
-    in Coordinator identical regardless of backend — a Redis-backed
-    subclass needs `await` on real network calls; this one just returns
-    immediately. See RedisJobStoreAdapter in the consumer project for the
+    where nothing actually waits on I/O. See RedisJobStoreAdapter in the consumer project for the
     backend that actually needs the async-ness.
     """
     def __init__(self, store: dict[str, dict[str, Any]]) -> None:
         self._store = store
 
     async def get_pending_jobs(self) -> list[dict[str, Any]]:
+        """TODO: Docstring"""
         return [job for job in self._store.values() if job["status"] == "pending"]
 
     async def mark_running(self, job_id: str) -> None:
+        """TODO: Docstring"""
         if job_id in self._store:
             self._store[job_id]["status"] = "running"
 
     async def mark_completed(self, job_id: str, results: list[dict]) -> None:
+        """TODO: Docstring"""
         existing = await self.get(job_id)
         if existing is not None and existing.get("status") in ("completed", "failed", "cancelled"):
             logger.warning(
@@ -87,15 +83,18 @@ class JobStoreAdapter:
         self._store[job_id]["results"] = results
 
     async def mark_failed(self, job_id: str, error: str) -> None:
+        """TODO: Docstring"""
         if job_id in self._store:
             self._store[job_id]["status"] = "failed"
             self._store[job_id]["error"] = error
 
     async def is_cancelled(self, job_id: str) -> bool:
+        """TODO: Docstring"""
         job = self._store.get(job_id)
         return job is not None and job["status"] == "cancelled"
 
     async def get(self, job_id: str) -> Optional[dict[str, Any]]:
+        """TODO: Docstring"""
         return self._store.get(job_id)
 
 
@@ -105,8 +104,7 @@ class _JobTracker:
     """
     Tracks in-flight task counts and accumulated results per job.
 
-    The coordinator needs to know when all tasks for a job are done
-    so it can mark the job completed. This tracker maintains:
+    This tracker maintains:
         - How many tasks are still outstanding for each job
         - The accumulated result dicts as they arrive
 
@@ -120,25 +118,30 @@ class _JobTracker:
         self._results: dict[str, list[dict]] = {} # job_id → accumulated results
 
     def register(self, job_id: str, task_count: int) -> None:
+        """TODO: Docstring"""
         self._pending[job_id] = self._pending.get(job_id, 0) + task_count
         if job_id not in self._results:
             self._results[job_id] = []
 
     def is_tracked(self, job_id: str) -> bool:
-        """True until cleanup() runs for this job_id. Callers MUST check
-        this before record_result()/decrement(). A result arriving for an
-        untracked job_id means the job was already finalised — almost
-        always a duplicate task execution from stale-task recovery racing
-        a slow-but-alive agent — and must be dropped, not re-finalised."""
+        """
+        True until cleanup() runs for this job_id.
+        Callers MUST check this before record_result()/decrement().
+        A result arriving for an untracked job_id means the job was already finalised:
+        must be dropped, not re-finalised.
+        """
         return job_id in self._pending
 
     def record_result(self, job_id: str, output: dict) -> None:
+        """TODO: Docstring"""
         self._results.setdefault(job_id, []).append(output)
 
     def decrement(self, job_id: str) -> Optional[int]:
-        """Decrement outstanding count. Returns new count, or None if
-        job_id is not currently tracked. Callers must check is_tracked()
-        first; None here is a backstop, not the primary guard."""
+        """
+        Decrement outstanding count.
+        :return: new count, or None if job_id is not currently tracked.
+        Callers must check is_tracked() first.
+        """
         if job_id not in self._pending:
             return None
         count = max(0, self._pending[job_id] - 1)
@@ -146,9 +149,11 @@ class _JobTracker:
         return count
 
     def get_results(self, job_id: str) -> list[dict]:
+        """TODO: Docstring"""
         return self._results.get(job_id, [])
 
     def cleanup(self, job_id: str) -> None:
+        """TODO: Docstring"""
         self._pending.pop(job_id, None)
         self._results.pop(job_id, None)
 
@@ -202,14 +207,16 @@ class Coordinator:
 
         self._stop_event = asyncio.Event()
 
-        # Track which job_ids have already been dispatched so the dispatch
-        # loop doesn't re-enqueue a running job on the next poll cycle.
+        # Track already dispatched job_ids so the dispatch loop
+        # doesn't re-enqueue a running job on the next poll cycle.
         self._dispatched: set[str] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start all coordinator loops. Blocks until stop() is called."""
+        """
+        Start all coordinator loops. Blocks until stop() is called.
+        """
         logger.info("Coordinator starting")
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._dispatch_loop())
@@ -228,12 +235,11 @@ class Coordinator:
         Cancel a job's outstanding work.
 
         Job is published to cancelled_jobs set BEFORE pending tasks are purged.
-        Agents consult the set after a failed attempt & acknowledge instead of re-enqueueing,
-        so once entry exists no new retries can be queued for this job.
-
+        Agents consult the set after a failed attempt & acknowledge instead of re-enqueueing.
+        
         Tasks already claimed by an agent are not interrupted -- their results are dropped by
-        _result_loop once the job store reports the job as cancelled. Callers must mark the job
-        cancelled in the store before calling this.
+        _result_loop once the job store reports the job as cancelled.
+        Callers MUST mark the job cancelled in the store before calling this.
 
         :return: Number of pending tasks removed from the queue.
         """
@@ -334,7 +340,6 @@ class Coordinator:
 
                 elif result.status == "failed":
                     # Task will be retried — the agent already re-enqueued it.
-                    # Do not decrement the counter yet; we'll see the result again.
                     logger.info(
                         f"Task {result.task_id} failed "
                         f"(attempt {result.retry_count}/{result.max_retries}) "

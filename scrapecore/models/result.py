@@ -9,8 +9,7 @@ The result travels through a separate Redis list:
 
 The coordinator polls this list and updates the job store accordingly.
 
-Two outcomes:
-
+2 outcomes:
     Success:
         status = "completed"
         output = consumer-defined dict (serialized PriceList, etc.)
@@ -21,7 +20,7 @@ Two outcomes:
         output = None
         error  = exception message string
 
-    Failure (permanent — retry_count >= max_retries):
+    Failure (permanent, i.e retry_count >= max_retries):
         status = "exhausted"
         output = None
         error  = exception message string
@@ -32,8 +31,7 @@ as permanently failed in the job store.
 
 Stage metadata:
     Certain parsers produce intermediate data that the coordinator needs
-    to build the next stage of tasks (e.g. autopiter Stage 1 producing
-    catalog IDs for Stage 2). This data is returned in the `stage_output`
+    to build the next stage of tasks. This data is returned in the `stage_output`
     field — a separate dict from the final `output`. The coordinator reads
     stage_output to spawn follow-up tasks; it is not stored in job results.
 """

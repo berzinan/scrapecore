@@ -16,9 +16,8 @@ class AiohttpBackend:
     """
     HTTP backend backed by aiohttp.
 
-    This is the default backend. It works for the majority of sites
-    that do not perform TLS fingerprint checks. For Cloudflare-protected
-    sites, use CurlCffiBackend instead.
+    Default backend: Works for the majority of sites that don't check TLS fingerprints.
+    For Cloudflare-protected sites, use CurlCffiBackend instead.
 
     Args:
         timeout:    Total request timeout in seconds.
@@ -45,7 +44,7 @@ class AiohttpBackend:
         """
         Return the shared session, creating it on first use.
 
-        Lazy initialisation means the session is created inside the running
+        Lazy initialisation: session is created inside the running
         event loop, which is a requirement for aiohttp.
         """
         if self._session is None or self._session.closed:

@@ -4,33 +4,10 @@ scrapecore/plugins/base.py
 Abstract base classes that consumer parsers and output models must implement.
 
 These classes define the contract between the library and the consumer.
-The library never knows what a PriceList or a _Part is — it only knows
-that parsers return something with a to_dict() method, and that task
-builders return something with a to_envelope() method.
+The library only knows that parsers return something with a to_dict() method,
+and that task builders return something with a to_envelope() method.
 
-Consumer usage example (in gng_pricing):
-
-    from scrapecore.plugins.base import BaseParser, BaseOutput
-    from scrapecore.models.task import TaskEnvelope
-
-    @dataclass
-    class PriceList(BaseOutput):
-        query_code: str
-        items: list
-
-        def to_dict(self) -> dict:
-            return {"query_code": self.query_code, "items": [...]}
-
-    class AppraiseParser(BaseParser):
-        key = "autopiter.parse_appraise"
-
-        def parse(self, raw: Any, metadata: dict) -> PriceList:
-            # ... parse raw JSON into PriceList ...
-            return PriceList(...)
-
-        def build_task(self, job: dict) -> list[TaskEnvelope]:
-            # ... construct TaskEnvelopes from job record ...
-            return [TaskEnvelope(...)]
+TODO: Add example
 """
 
 from __future__ import annotations
@@ -75,9 +52,7 @@ class BaseOutput(ABC):
         Override this in Stage 1 parsers that need to pass data to Stage 2.
         The returned dict will appear in ResultEnvelope.stage_output.
 
-        Example (autopiter search parser):
-            def to_stage_output(self) -> dict:
-                return {"catalogs": self.catalogs}
+        #TODO: Example
         """
         return None
 
@@ -91,7 +66,7 @@ class BaseParser(ABC):
     Subclasses must define:
         key:   A unique string identifying this parser. Must match the
                parser_key field in TaskEnvelope exactly.
-               Convention: "{site}.{stage}"  e.g. "autopiter.parse_appraise"
+               Convention: "{site}.{stage}"  e.g. "mysite.endpoint1"
 
         parse: The parsing function. Receives the raw HTTP response and
                the metadata dict from the task payload. Returns a BaseOutput.
@@ -118,7 +93,7 @@ class BaseParser(ABC):
         if not cls.key:
             raise TypeError(
                 f"{cls.__name__} must define a non-empty class attribute 'key'. "
-                f"Example: key = 'autopiter.parse_appraise'"
+                f"Example: key = 'mysite.endpoint1'"
             )
 
     @abstractmethod
@@ -130,8 +105,7 @@ class BaseParser(ABC):
             raw:      The HTTP response body. Will be a parsed dict for
                       JSON responses, a string for HTML responses.
             metadata: The metadata dict from the task payload. Contains
-                      anything the task builder put there — part codes,
-                      article IDs, catalog names, etc.
+                      anything the task builder put there. 
 
         Returns:
             A BaseOutput subclass instance. The agent will call to_dict()

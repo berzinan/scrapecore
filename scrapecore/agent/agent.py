@@ -29,10 +29,10 @@ class Agent:
     """
     Remote worker process. Polls the task queue and executes scrape tasks.
 
-    One Agent instance corresponds to one account/session. Throughput scaling
-    is achieved by running multiple Agent instances with distinct credentials,
-    not by adding workers within a single instance. The run loop is a single
-    sequential coroutine: claim → rate-limit → execute → push result.
+    1 Agent instance == 1 account/session.
+    Throughput scaling is achieved by running multiple Agent instances.
+    The run loop is a single sequential coroutine:
+    claim → rate-limit → execute → push result.
 
     Args:
         agent_id:           Unique name for this agent instance.
@@ -40,21 +40,19 @@ class Agent:
         parser_registry:    Dict mapping parser_key strings to callable parsers.
         namespace:          Must match the namespace used by the coordinator.
         rate_limit_config:  Dict mapping parser_key → requests_per_second.
-                            Each key gets its own independent rate bucket so
-                            pipeline stages with different server-side limits
-                            can be tuned independently.
+                            Each key gets its own independent rate bucket.
                             Example:
                                 {
-                                    "autopiter.parse_searchdetails": 0.15,
-                                    "autopiter.parse_getcosts":      0.03,
-                                    "autopiter.parse_appraise":      0.03,
+                                    "mysite.endpoint1": 0.15,
+                                    "mysite.endpoint2": 0.03,
+                                    "mysite.endpoint3": 0.03,
                                 }
                             Parser keys absent from this dict fall back to
-                            1.0 RPS, domain-keyed (conservative default).
+                            1.0 RPS, domain-keyed.
         claim_timeout:      Seconds the run loop blocks on an empty queue.
         heartbeat_interval: Seconds between heartbeat writes to Redis.
         task_timeout:       Total HTTP timeout in seconds.
-                            Ignored if a custom http_backend is provided.
+                            Ignored if custom http_backend is provided.
         proxy:              Proxy URL forwarded to every backend request.
                             Ignored if a custom http_backend is provided.
         http_backend:       HTTP backend. Defaults to AiohttpBackend.
@@ -130,9 +128,7 @@ class Agent:
         """
         Single sequential execution loop: claim → execute → push.
 
-        One task is in flight at a time per agent. Multiple accounts →
-        multiple agents → multiple parallel executions, each with its own
-        session and rate limiter state.
+        One task is in flight at a time per agent.
         """
         logger.debug(f"Agent {self.agent_id!r} run loop started")
 
@@ -199,14 +195,11 @@ class Agent:
         """
         Resolve parser → rate-limit → HTTP (with backoff retry) → parse → return.
 
-        Auth headers are re-applied on every retry attempt so a session refresh
-        that fires between attempts is reflected immediately.
+        Auth headers are re-applied on every retry attempt.
 
         A background task renews this task's claim in Redis every 20s for as
-        long as execution is in flight (including HTTP backoff sleeps), so the
-        coordinator's stale-task recovery doesn't mistake a slow-but-alive
-        execution for a dead agent. Cancelled in `finally` regardless of how
-        this method exits.
+        long as execution is in flight (including HTTP backoff sleeps).
+        Cancelled in `finally` regardless of how this method exits.
         """
         payload      = envelope.payload
         url          = payload["url"]
@@ -329,8 +322,7 @@ class Agent:
         Enforce per-parser-key rate limiting.
 
         Each parser key in rate_limit_config gets its own Lock and timestamp,
-        so searchdetails (0.15 RPS) and appraise (0.03 RPS) run against
-        completely independent buckets and do not block each other.
+        so distinct parsers run against independent buckets and don't block each other.
         """
         from urllib.parse import urlparse
 
@@ -354,6 +346,7 @@ class Agent:
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
+        """TODO: Docstring"""
         key    = f"scrapecore:{self._namespace}:heartbeat:{self.agent_id}"
         expiry = int(self._heartbeat_interval * 3)
 
@@ -374,6 +367,7 @@ class Agent:
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict[str, Any]:
+        """TODO: Docstring"""
         return {
             "agent_id":        self.agent_id,
             "tasks_completed": self.tasks_completed,
