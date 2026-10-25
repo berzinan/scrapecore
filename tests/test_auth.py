@@ -29,7 +29,7 @@ from typing import Optional
 
 from scrapecore.agent.agent import Agent
 from scrapecore.models.task import TaskEnvelope
-from scrapecore.http.base import HttpResponse, HttpBackendError
+from scrapecore.http.base import HttpResponse, HttpBackendError, ScrapeFailedError
 from scrapecore.plugins.auth import BaseAuth
 
 
@@ -156,7 +156,7 @@ async def test_handle_response_called_on_success():
 
 async def test_handle_response_called_on_http_error():
     """On a 401, handle_response runs (e.g. to invalidate a cached token)
-    BEFORE _execute converts the error into a RuntimeError."""
+    BEFORE _execute converts the error into a ScrapeFailedError."""
     error = HttpBackendError(
         status=401, message="unauthorized",
         url="http://example.com/resource",
@@ -168,10 +168,10 @@ async def test_handle_response_called_on_http_error():
 
     try:
         await agent._execute(_envelope())
-    except RuntimeError as e:
+    except ScrapeFailedError as e:
         assert "401" in str(e)
     else:
-        raise AssertionError("Expected RuntimeError for HTTP 401")
+        raise AssertionError("Expected ScrapeFailedError for HTTP 401")
 
     assert len(auth.response_calls) == 1
     status, headers, url = auth.response_calls[0]

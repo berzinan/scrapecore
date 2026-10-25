@@ -51,6 +51,12 @@ class NetworkError(Exception):
     Replaces aiohttp.ClientError.
     """
 
+class ScrapeFailedError(Exception):
+    """A task failed in an expected way (HTTP error, network error, retries exhausted).
+       Surfaces to ResultEnvelope.error without 'Unhandled: ' prefix that _run_loop applies
+       to genuinely unexpected exceptions.
+    """
+
 
 @runtime_checkable
 class HttpBackend(Protocol):
