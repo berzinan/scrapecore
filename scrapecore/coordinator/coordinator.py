@@ -224,10 +224,24 @@ class Coordinator:
         self._stop_event.set()
 
     async def cancel_job(self, job_id: str) -> int:
-        """#TODO: Docstring"""
+        """
+        Cancel a job's outstanding work.
+
+        Job is published to cancelled_jobs set BEFORE pending tasks are purged.
+        Agents consult the set after a failed attempt & acknowledge instead of re-enqueueing,
+        so once entry exists no new retries can be queued for this job.
+
+        Tasks already claimed by an agent are not interrupted -- their results are dropped by
+        _result_loop once the job store reports the job as cancelled. Callers must mark the job
+        cancelled in the store before calling this.
+
+        :return: Number of pending tasks removed from the queue.
+        """
+        cancelled_key = f"scrapecore:{self._namespace}:cancelled_jobs"
+        await self._redis.sadd(cancelled_key, job_id)
+        await self._redis.expire(cancelled_key, 3600)
         self._tracker.cleanup(job_id)
         removed = await self._task_queue.cancel_job_tasks(job_id)
-        logger.info(f"Coordinator cancelled job {job_id}: {removed} pending task(s) removed from Redis")
         return removed
 
     # ── Loop 1: dispatch ──────────────────────────────────────────────────────
@@ -247,13 +261,7 @@ class Coordinator:
                     if job_id in self._dispatched:
                         continue
                     if await self._store.is_cancelled(job_id):
-                        await self._redis.sadd(
-                            f"scrapecore:{self._namespace}:cancelled_jobs", job_id
-                        )
-                        await self._redis.expire(
-                            f"scrapecore:{self._namespace}:cancelled_jobs", 3600
-                        )
-                        logger.info(f"Dropping result for cancelled job {job_id}")
+                        logger.info(f"Skipping dispatch for cancelled job {job_id}")
                         continue
 
                     try:

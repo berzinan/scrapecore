@@ -91,6 +91,44 @@ async def test_successful_task(fake_redis, namespace):
     assert await task_queue.processing_count() == 0
     assert await task_queue.pending_count() == 0
 
+# ── Task cancellation ──────────────────────────────────────────────────────────
+async def test_cancelled_job_stops_retries(fake_redis, namespace):
+    """When a job is in the cancelled_jobs set, a failed task is acknowledged
+    instead of re-enqueued at queue level, so the queue drains."""
+    def parser(raw, metadata):
+        return {}
+
+    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+
+    cancelled_key = f"scrapecore:{namespace}:cancelled_jobs"
+    await fake_redis.sadd(cancelled_key, "job-cancel")
+
+    url = "https://example.com/cancelled"
+    envelope = TaskEnvelope(
+        job_id="job-cancel", parser_key="site.parse",
+        payload={"url": url},
+        max_retries=3,
+    )
+    await _enqueue(fake_redis, namespace, envelope)
+
+    with aioresponses() as mock:
+        mock.get(url, status=500, repeat=True)
+        await _run_agent_until(agent, lambda: agent.tasks_failed >= 1, timeout=5.0)
+
+    # Exhausted once, then acknowledged — not retried at the queue level.
+    assert await task_queue.pending_count() == 0
+    assert await task_queue.processing_count() == 0
+
+    statuses = []
+    while True:
+        r = await result_queue.pop(timeout=0.1)
+        if r is None:
+            break
+        statuses.append(r.status)
+
+    assert statuses == ["failed"]
 
 # ── HTTP errors ──────────────────────────────────────────────────────────────
 
