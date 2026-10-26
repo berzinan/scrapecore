@@ -29,9 +29,8 @@ Consumer integration:
         Awaited once per result for a live, tracked job, before the
         coordinator updates its own job state. Use it for per-task side
         effects such as persisting output or updating progress.
-        Delivery is at-least-once: the same task may be reported twice
-        (stale-task recovery racing a slow agent), so the hook must be
-        idempotent. Exceptions are logged and swallowed.
+        Delivery is at-least-once: the same task may be reported twice,
+        so the hook is idempotent. Exceptions are logged and swallowed.
 
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
@@ -368,10 +367,8 @@ class Coordinator:
                     logger.warning(
                         f"Dropping {result.status} result for task "
                         f"{result.task_id}: job {job_id} is not tracked "
-                        f"(already finalised). This is almost always a "
-                        f"duplicate task execution from stale-task recovery "
-                        f"racing a slow (not dead) agent. No job state was "
-                        f"modified."
+                        f"(already finalised). This is likely a "
+                        f"duplicate task execution from stale-task recovery."
                     )
                     continue
 
@@ -406,10 +403,9 @@ class Coordinator:
         """
         Await the consumer's on_result hook, if one was supplied.
 
-        Exceptions are logged and swallowed: a failing hook must not kill the
-        result loop or leave the job stuck in "running". The result has
-        already been popped from Redis, so a failed hook means that result's
-        consumer-side effects are lost (not retried).
+        Exceptions are logged and swallowed.
+        The result has already been popped from Redis, so a failed hook means
+        that result's consumer-side effects are lost (not retried).
         CancelledError is not caught, so shutdown still propagates.
         """
         if self._on_result is None:
@@ -419,9 +415,7 @@ class Coordinator:
         except Exception as e:
             logger.error(
                 f"on_result hook failed for task {result.task_id} "
-                f"(job {result.job_id}, status={result.status}): {e}. "
-                f"Job bookkeeping continues; this result's consumer-side "
-                f"effects were not applied.",
+                f"(job {result.job_id}, status={result.status}): {e}. ",
                 exc_info=True,
             )
 
