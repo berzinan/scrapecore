@@ -334,9 +334,7 @@ class Agent:
         Enforce the parser contract and split output from stage data.
 
         Runs inside _execute, so a violation raises here and becomes an
-        ordinary failed/exhausted result. Without the JSON check, a value
-        like a datetime would only fail later, in ResultQueue.push(), which
-        is outside the run loop's error handling and would kill the agent.
+        ordinary failed/exhausted result.
 
         :return: (output, stage_output). The parser's dict is not mutated.
         :raises TypeError: on any contract violation.

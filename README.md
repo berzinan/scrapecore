@@ -101,8 +101,7 @@ class ItemParser(BaseParser):
 ```
 
 The parser MUST return a plain, JSON-serializable `dict` (str, int, float,
-bool, None, and nested dicts/lists of those). If you use typed models
-internally (dataclasses, pydantic), convert to a dict before returning.
+bool, None, and nested dicts/lists of those). 
 Anything else — an object, a `datetime`, a `set` — fails the task with a
 `TypeError`.
 

@@ -1,7 +1,7 @@
 """
 scrapecore/plugins/base.py
 
-The contract between the library and consumer parsers.
+Contract between the library and consumer parsers.
 
 A parser returns a plain, JSON-serializable dict. That dict becomes
 ResultEnvelope.output. To trigger a next stage, wrap the output with
