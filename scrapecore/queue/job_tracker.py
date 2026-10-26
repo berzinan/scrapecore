@@ -2,22 +2,17 @@
 scrapecore/queue/job_tracker.py
 
 JobTracker — Redis-backed record of which tasks each running job is still
-waiting on. Replaces the coordinator's in-memory counter so job progress
-survives a coordinator restart.
+waiting on.
 
-Tracking task IDs instead of a count makes completion idempotent: removing
-a task ID that is already gone is a no-op, so a duplicate result (stale-task
-recovery racing a slow agent) cannot finish a job early.
+completion is idempotent: removing a task ID that is already gone is a no-op,
+so a duplicate result cannot finish a job early.
 
 Keys:
     scrapecore:{namespace}:jobs:active               SET  job_ids being tracked
     scrapecore:{namespace}:job:{job_id}:outstanding  SET  task_ids not yet finished
     scrapecore:{namespace}:job:{job_id}:stats        HASH succeeded / exhausted counts
 
-`jobs:active` is the source of truth for "is this job tracked". The
-outstanding set cannot serve that purpose because Redis deletes a set when
-its last member is removed, so "tracked with nothing outstanding" and "not
-tracked" would look the same.
+`jobs:active` is the source of truth for "is this job tracked".
 
 Requires Redis persistence (AOF) to survive a Redis restart.
 """

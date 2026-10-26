@@ -403,7 +403,7 @@ UPDATE jobs SET status = 'running' WHERE status = 'pending' RETURNING *;
 ```
 
 `mark_completed` receives outcome counts (`{"succeeded": n, "exhausted": m}`),
-not task outputs. Persist outputs per task in your `on_result` hook.
+not task outputs. Persist outputs per task in `on_result`.
 
 A `JobRecord` must always have at least: `job_id`, `status` (`pending`,
 `running`, `completed`, `failed` or `cancelled`), `error`, plus any fields

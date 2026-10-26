@@ -41,10 +41,8 @@ Result delivery:
     This assumes exactly one coordinator runs per namespace.
 
 Coordinator state:
-    Which tasks each running job is still waiting on lives in Redis
-    (JobTracker), not in process memory, so a restarted coordinator picks up
-    every running job where it left off. Redis must persist to disk (AOF)
-    for this to survive a Redis restart too.
+    Which tasks each running job is still waiting on lives in Redis (JobTracker).
+    Redis must persist to disk (AOF) for this to survive a Redis restart too.
 
     Jobs are claimed atomically from the job store (pending → running), so a
     job is dispatched once. A job left "running" but untracked by a crash
@@ -95,8 +93,7 @@ class JobStoreAdapter:
         Atomically move every pending job to running and return those jobs.
 
         Must be atomic in a real backend: a job returned here must never be
-        returned to another caller. In SQL this is a single
-        UPDATE ... SET status = 'running' WHERE status = 'pending' RETURNING *.
+        returned to another caller.
         """
         claimed = []
         for job in self._store.values():
@@ -216,9 +213,7 @@ class Coordinator:
         self._stop_event = asyncio.Event()
 
         # Serialises "push tasks + update tracker" (dispatch, stage
-        # transitions) against result handling. Without it, an agent could
-        # finish a just-pushed task and the result loop could handle it
-        # before the tracker knows the task exists, dropping it as untracked.
+        # transitions) against result handling.
         self._state_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -306,12 +301,6 @@ class Coordinator:
     async def _reconcile_running_jobs(self) -> None:
         """
         Re-dispatch jobs the store says are running but the tracker does not know.
-
-        That state only arises when a coordinator claimed a job and died (or
-        hit an error) before registering its tasks. Finalisation writes the
-        store before clearing the tracker, so finished jobs never match.
-        Re-dispatching may duplicate tasks already pushed; their results are
-        dropped as not outstanding.
         """
         for job in await self._store.get_running_jobs():
             job_id = job["job_id"]
@@ -488,11 +477,7 @@ class Coordinator:
     async def _handle_stage_transition(self, result: ResultEnvelope) -> bool:
         """
         Enqueue a stage result's follow-up tasks and swap them in for it.
-
-        Follow-ups are pushed before the tracker swap, for the same reason
-        as in _dispatch_job: a crash in between leaves the parent task
-        outstanding, so the requeued result runs this again (duplicating
-        some tasks) rather than leaving the job waiting on unqueued IDs.
+        Follow-ups are pushed before the tracker swap.
 
         :return: True if follow-ups replaced the task. False if there were
                  none, in which case the caller completes it as final.
@@ -578,7 +563,7 @@ class Coordinator:
 
         Writes the store BEFORE clearing tracker state. If the store raises,
         the job is still tracked, and the requeued result finalises it on
-        the retry instead of being dropped as untracked.
+        the retry.
         """
         stats = await self._tracker.stats(job_id)
         if stats["succeeded"]:
