@@ -364,7 +364,7 @@ from scrapecore.queue.redis_client import create_redis_client
 
 presence = AgentPresence(create_redis_client(), namespace="default")
 agents = await presence.list_online()   # sorted by agent_id
-
+```
 ---
 ## Environment variables
 
@@ -379,7 +379,6 @@ The Redis client factory reads these:
 | `REDIS_PASSWORD` | —             |                                          |
 
 ---
-
 ## Job store: bring your own
 
 The default `JobStoreAdapter` wraps an in-memory dict. For anything beyond
