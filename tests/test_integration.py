@@ -88,4 +88,4 @@ async def test_full_pipeline_single_stage():
         await redis.aclose()
 
     assert store["job-1"]["status"] == "completed"
-    assert store["job-1"]["results"] == [{"value": 99}]
+    assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}

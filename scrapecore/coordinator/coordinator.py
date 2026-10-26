@@ -40,6 +40,16 @@ Result delivery:
     Results left in-flight by a crashed coordinator are recovered at the next start().
     This assumes exactly one coordinator runs per namespace.
 
+Coordinator state:
+    Which tasks each running job is still waiting on lives in Redis
+    (JobTracker), not in process memory, so a restarted coordinator picks up
+    every running job where it left off. Redis must persist to disk (AOF)
+    for this to survive a Redis restart too.
+
+    Jobs are claimed atomically from the job store (pending → running), so a
+    job is dispatched once. A job left "running" but untracked by a crash
+    mid-dispatch is re-dispatched on the next dispatch cycle.
+
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
     (JobStoreAdapter defined below) to keep it testable in isolation.
@@ -59,6 +69,7 @@ from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
 from scrapecore.queue.presence import AgentPresence
+from scrapecore.queue.job_tracker import JobTracker
 
 logger = logging.getLogger(__name__)
 
@@ -69,109 +80,71 @@ class JobStoreAdapter:
     """
     Narrow interface between the coordinator and the job store.
 
-    Every method is async even on this in-memory default implementation,
-    where nothing actually waits on I/O. See RedisJobStoreAdapter in the consumer project for the
-    backend that actually needs the async-ness.
+    This default implementation wraps an in-memory dict and is meant for
+    tests and prototyping. Consumers subclass it and back it with a real
+    database. Every method is async for that reason.
+
+    A job record is a dict with at least "job_id" and "status", where
+    status is one of: pending, running, completed, failed, cancelled.
     """
     def __init__(self, store: dict[str, dict[str, Any]]) -> None:
         self._store = store
 
-    async def get_pending_jobs(self) -> list[dict[str, Any]]:
-        """TODO: Docstring"""
-        return [job for job in self._store.values() if job["status"] == "pending"]
+    async def claim_pending_jobs(self) -> list[dict[str, Any]]:
+        """
+        Atomically move every pending job to running and return those jobs.
 
-    async def mark_running(self, job_id: str) -> None:
-        """TODO: Docstring"""
-        if job_id in self._store:
-            self._store[job_id]["status"] = "running"
+        Must be atomic in a real backend: a job returned here must never be
+        returned to another caller. In SQL this is a single
+        UPDATE ... SET status = 'running' WHERE status = 'pending' RETURNING *.
+        """
+        claimed = []
+        for job in self._store.values():
+            if job["status"] == "pending":
+                job["status"] = "running"
+                claimed.append(job)
+        return claimed
 
-    async def mark_completed(self, job_id: str, results: list[dict]) -> None:
-        """TODO: Docstring"""
+    async def get_running_jobs(self) -> list[dict[str, Any]]:
+        """
+        Return every job with status running.
+
+        Polled each dispatch cycle to find jobs a crashed coordinator
+        claimed but never finished dispatching.
+        """
+        return [job for job in self._store.values() if job["status"] == "running"]
+
+    async def mark_completed(self, job_id: str, summary: dict[str, int]) -> None:
+        """
+        Mark a job completed. Ignored if the job already reached a final status.
+
+        :param summary: {"succeeded": n, "exhausted": m} task outcome counts.
+                        Task outputs are delivered through on_result, not here.
+        """
         existing = await self.get(job_id)
         if existing is not None and existing.get("status") in ("completed", "failed", "cancelled"):
             logger.warning(
                 f"mark_completed called for job {job_id} which is already "
-                f"'{existing['status']}' - ignoring to avoid overwriting final results."
+                f"'{existing['status']}' - ignoring."
             )
             return
         self._store[job_id]["status"] = "completed"
-        self._store[job_id]["results"] = results
+        self._store[job_id]["summary"] = summary
 
     async def mark_failed(self, job_id: str, error: str) -> None:
-        """TODO: Docstring"""
+        """Mark a job failed with a human-readable reason."""
         if job_id in self._store:
             self._store[job_id]["status"] = "failed"
             self._store[job_id]["error"] = error
 
     async def is_cancelled(self, job_id: str) -> bool:
-        """TODO: Docstring"""
+        """True if the job's status is cancelled."""
         job = self._store.get(job_id)
         return job is not None and job["status"] == "cancelled"
 
     async def get(self, job_id: str) -> Optional[dict[str, Any]]:
-        """TODO: Docstring"""
+        """Return the job record, or None if it does not exist."""
         return self._store.get(job_id)
-
-
-# ── Job tracker ───────────────────────────────────────────────────────────────
-
-class _JobTracker:
-    """
-    Tracks in-flight task counts and accumulated results per job.
-
-    This tracker maintains:
-        - How many tasks are still outstanding for each job
-        - The accumulated result dicts as they arrive
-
-    Not persisted — lives only in coordinator memory. If the coordinator
-    restarts mid-job, this state is lost: the job stays "running" in the
-    store and every later result for it is dropped as untracked. Stale-task
-    recovery does NOT cover this case.
-    """
-
-    def __init__(self) -> None:
-        self._pending: dict[str, int] = {}        # job_id → outstanding task count
-        self._results: dict[str, list[dict]] = {} # job_id → accumulated results
-
-    def register(self, job_id: str, task_count: int) -> None:
-        """TODO: Docstring"""
-        self._pending[job_id] = self._pending.get(job_id, 0) + task_count
-        if job_id not in self._results:
-            self._results[job_id] = []
-
-    def is_tracked(self, job_id: str) -> bool:
-        """
-        True until cleanup() runs for this job_id.
-        Callers MUST check this before record_result()/decrement().
-        A result arriving for an untracked job_id means the job was already finalised:
-        must be dropped, not re-finalised.
-        """
-        return job_id in self._pending
-
-    def record_result(self, job_id: str, output: dict) -> None:
-        """TODO: Docstring"""
-        self._results.setdefault(job_id, []).append(output)
-
-    def decrement(self, job_id: str) -> Optional[int]:
-        """
-        Decrement outstanding count.
-        :return: new count, or None if job_id is not currently tracked.
-        Callers must check is_tracked() first.
-        """
-        if job_id not in self._pending:
-            return None
-        count = max(0, self._pending[job_id] - 1)
-        self._pending[job_id] = count
-        return count
-
-    def get_results(self, job_id: str) -> list[dict]:
-        """TODO: Docstring"""
-        return self._results.get(job_id, [])
-
-    def cleanup(self, job_id: str) -> None:
-        """TODO: Docstring"""
-        self._pending.pop(job_id, None)
-        self._results.pop(job_id, None)
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -238,13 +211,15 @@ class Coordinator:
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
         self._presence = AgentPresence(redis, namespace)
-        self._tracker = _JobTracker()
+        self._tracker = JobTracker(redis, namespace)
 
         self._stop_event = asyncio.Event()
 
-        # Track already dispatched job_ids so the dispatch loop
-        # doesn't re-enqueue a running job on the next poll cycle.
-        self._dispatched: set[str] = set()
+        # Serialises "push tasks + update tracker" (dispatch, stage
+        # transitions) against result handling. Without it, an agent could
+        # finish a just-pushed task and the result loop could handle it
+        # before the tracker knows the task exists, dropping it as untracked.
+        self._state_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -283,7 +258,7 @@ class Coordinator:
         cancelled_key = f"scrapecore:{self._namespace}:cancelled_jobs"
         await self._redis.sadd(cancelled_key, job_id)
         await self._redis.expire(cancelled_key, 3600)
-        self._tracker.cleanup(job_id)
+        await self._tracker.cleanup(job_id)
         removed = await self._task_queue.cancel_job_tasks(job_id)
         return removed
 
@@ -301,60 +276,100 @@ class Coordinator:
 
     async def _dispatch_loop(self) -> None:
         """
-        Poll the job store for pending jobs and enqueue their tasks.
+        Each cycle: re-dispatch orphaned running jobs, then claim and
+        dispatch pending ones.
 
-        Runs every dispatch_interval seconds. Skips jobs already dispatched
-        this session. Marks jobs as running immediately after dispatch so
-        the API reflects state correctly.
+        Runs every dispatch_interval seconds. A failure dispatching one job
+        does not block the others; a job left running but untracked by that
+        failure is picked up by the next cycle's reconcile step.
         """
         while not self._stop_event.is_set():
             try:
-                for job in await self._store.get_pending_jobs():
-                    job_id = job["job_id"]
-                    if job_id in self._dispatched:
-                        continue
-                    if await self._store.is_cancelled(job_id):
-                        logger.info(f"Skipping dispatch for cancelled job {job_id}")
-                        continue
-
-                    try:
-                        tasks = self._task_factory(job)
-                    except Exception as e:
-                        logger.error(f"task_factory failed for job {job_id}: {e}")
-                        await self._store.mark_failed(job_id, f"task_factory error: {e}")
-                        self._dispatched.add(job_id)
-                        continue
-
-                    if not tasks:
-                        logger.warning(f"task_factory returned no tasks for job {job_id}")
-                        await self._store.mark_failed(job_id, "No tasks produced by task_factory")
-                        self._dispatched.add(job_id)
-                        continue
-
-                    self._tracker.register(job_id, len(tasks))
-                    for envelope in tasks:
-                        await self._task_queue.push(
-                            envelope.task_id,
-                            envelope.to_dict(),
-                            priority=envelope.priority,
-                        )
-
-                    await self._store.mark_running(job_id)
-                    self._dispatched.add(job_id)
-                    logger.info(
-                        f"Job {job_id} dispatched: {len(tasks)} task(s) enqueued"
-                    )
-
+                await self._reconcile_running_jobs()
+                claimed = await self._store.claim_pending_jobs()
             except Exception as e:
                 logger.error(f"Dispatch loop error: {e}", exc_info=True)
+                claimed = []
 
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=self._dispatch_interval,
+            for job in claimed:
+                try:
+                    await self._dispatch_job(job)
+                except Exception as e:
+                    logger.error(
+                        f"Dispatching job {job.get('job_id')} failed: {e} "
+                        f"— will retry next cycle",
+                        exc_info=True,
+                    )
+
+            await self._sleep(self._dispatch_interval)
+
+    async def _reconcile_running_jobs(self) -> None:
+        """
+        Re-dispatch jobs the store says are running but the tracker does not know.
+
+        That state only arises when a coordinator claimed a job and died (or
+        hit an error) before registering its tasks. Finalisation writes the
+        store before clearing the tracker, so finished jobs never match.
+        Re-dispatching may duplicate tasks already pushed; their results are
+        dropped as not outstanding.
+        """
+        for job in await self._store.get_running_jobs():
+            job_id = job["job_id"]
+            if await self._tracker.is_tracked(job_id):
+                continue
+            logger.warning(
+                f"Job {job_id} is running in the store but not tracked "
+                f"— re-dispatching"
+            )
+            await self._dispatch_job(job)
+
+    async def _dispatch_job(self, job: dict[str, Any]) -> None:
+        """
+        Build a claimed job's first-stage tasks, enqueue them, and track them.
+
+        Tasks are pushed before being registered, under _state_lock. If the
+        process dies between the two, the job is running but untracked, and
+        _reconcile_running_jobs() re-dispatches it. The opposite order would
+        leave registered task IDs that were never enqueued, and the job
+        would wait on them forever.
+        """
+        job_id = job["job_id"]
+
+        try:
+            tasks = self._task_factory(job)
+        except Exception as e:
+            logger.error(f"task_factory failed for job {job_id}: {e}")
+            await self._store.mark_failed(job_id, f"task_factory error: {e}")
+            return
+
+        if not tasks:
+            logger.warning(f"task_factory returned no tasks for job {job_id}")
+            await self._store.mark_failed(job_id, "No tasks produced by task_factory")
+            return
+
+        task_ids = [t.task_id for t in tasks]
+        if len(set(task_ids)) != len(task_ids):
+            # Completion is tracked by task ID, so duplicates would let a
+            # job finish while a same-ID task is still running.
+            await self._store.mark_failed(job_id, "task_factory produced duplicate task_ids")
+            return
+
+        async with self._state_lock:
+            for envelope in tasks:
+                await self._task_queue.push(
+                    envelope.task_id,
+                    envelope.to_dict(),
+                    priority=envelope.priority,
                 )
-            except asyncio.TimeoutError:
-                pass
+            await self._tracker.register(job_id, task_ids)
+
+        # Cancelled between claim and register: cancel_job() may already
+        # have run and found nothing to clean up, so clean up now.
+        if await self._store.is_cancelled(job_id):
+            await self.cancel_job(job_id)
+            return
+
+        logger.info(f"Job {job_id} dispatched: {len(tasks)} task(s) enqueued")
 
     # ── Loop 2: results ───────────────────────────────────────────────────────
 
@@ -381,7 +396,8 @@ class Coordinator:
 
             raw, result = claimed
             try:
-                await self._process_result(raw, result)
+                async with self._state_lock:
+                    await self._process_result(raw, result)
             except Exception as e:
                 logger.error(
                     f"Handling result for task {result.task_id} "
@@ -402,53 +418,115 @@ class Coordinator:
         """
         Handle one claimed result.
 
-            - job cancelled or no longer tracked → drop (no hook, no state change)
-            - otherwise → on_result (with retries), then dispatch on status:
-            - "completed" with stage_output → call stage_handler, enqueue more tasks
-            - "completed" without stage_output → record output, decrement counter
-            - "failed" → task will be retried (agent already re-enqueued it)
-            - "exhausted" → record failure, decrement counter
+            - job cancelled or not tracked      → drop
+            - task no longer outstanding        → duplicate: drop, but finalise
+                                                  if nothing is outstanding
+            - otherwise → on_result (with retries), then by status:
+            - "failed"                          → no state change (agent retries)
+            - "completed" with stage_output     → replace task with follow-ups
+            - "completed" / "exhausted"         → complete task; finalise at zero
 
-        When a job's outstanding task count reaches zero, finalise it.
-        Raising from here causes the result to be requeued.
+        Raising from here causes the result to be requeued, so every step
+        must be safe to repeat.
         """
-        job_id = result.job_id
+        job_id, task_id = result.job_id, result.task_id
 
         if await self._store.is_cancelled(job_id):
             logger.info(f"Dropping result for cancelled job {job_id}")
             return
 
-        if not self._tracker.is_tracked(job_id):
+        if not await self._tracker.is_tracked(job_id):
             logger.warning(
-                f"Dropping {result.status} result for task "
-                f"{result.task_id}: job {job_id} is not tracked "
-                f"(already finalised). This is likely a "
-                f"duplicate task execution from stale-task recovery."
+                f"Dropping {result.status} result for task {task_id}: "
+                f"job {job_id} is not tracked (already finalised)."
             )
+            return
+
+        if not await self._tracker.is_outstanding(job_id, task_id):
+            # Either a duplicate execution, or this result is being handled
+            # again because a later step failed last time, most often
+            # _finalise_job(). In the second case the job is waiting on
+            # nothing and only finalisation is left to do.
+            if await self._tracker.remaining(job_id) == 0:
+                await self._finalise_job(job_id)
+            else:
+                logger.info(
+                    f"Dropping duplicate {result.status} result for task "
+                    f"{task_id}: already finished for job {job_id}."
+                )
             return
 
         await self._call_on_result(raw, result)
 
-        if result.status == "completed":
-            await self._handle_completed(result)
-
-        elif result.status == "failed":
+        if result.status == "failed":
             # Task will be retried — the agent already re-enqueued it.
             logger.info(
-                f"Task {result.task_id} failed "
-                f"(attempt {result.retry_count}/{result.max_retries}) "
-                f"— will retry"
+                f"Task {task_id} failed "
+                f"(attempt {result.retry_count}/{result.max_retries}) — will retry"
             )
+            return
 
-        elif result.status == "exhausted":
+        if result.status == "completed" and result.stage_output is not None:
+            if await self._handle_stage_transition(result):
+                return
+
+        if result.status == "exhausted":
+            logger.error(f"Task {task_id} exhausted retries: {result.error}")
+            outcome = "exhausted"
+        else:
+            outcome = "succeeded"
+
+        remaining = await self._tracker.complete_task(job_id, task_id, outcome)
+        if remaining is None:
+            logger.info(f"Job {job_id} was cancelled while task {task_id} was being handled.")
+            return
+
+        logger.info(f"Task {task_id} {outcome}. Job {job_id}: {remaining} task(s) remaining")
+        if remaining == 0:
+            await self._finalise_job(job_id)
+
+    async def _handle_stage_transition(self, result: ResultEnvelope) -> bool:
+        """
+        Enqueue a stage result's follow-up tasks and swap them in for it.
+
+        Follow-ups are pushed before the tracker swap, for the same reason
+        as in _dispatch_job: a crash in between leaves the parent task
+        outstanding, so the requeued result runs this again (duplicating
+        some tasks) rather than leaving the job waiting on unqueued IDs.
+
+        :return: True if follow-ups replaced the task. False if there were
+                 none, in which case the caller completes it as final.
+        """
+        job_id = result.job_id
+        try:
+            follow_up = self._stage_handler(result)
+        except Exception as e:
+            logger.error(f"stage_handler failed for task {result.task_id}: {e}")
+            return False
+
+        if not follow_up:
+            return False
+
+        new_ids = [envelope.task_id for envelope in follow_up]
+        if len(set(new_ids)) != len(new_ids):
             logger.error(
-                f"Task {result.task_id} exhausted retries: {result.error}"
+                f"stage_handler returned duplicate task_ids for task "
+                f"{result.task_id}; completing it without follow-ups."
             )
-            # decrement() returns None if the job was cancelled while
-            # on_result was being awaited.
-            remaining = self._tracker.decrement(job_id)
-            if remaining == 0:
-                await self._finalise_job(job_id)
+            return False
+
+        for envelope in follow_up:
+            await self._task_queue.push(
+                envelope.task_id,
+                envelope.to_dict(),
+                priority=envelope.priority,
+            )
+        await self._tracker.replace_task(job_id, result.task_id, new_ids)
+        logger.info(
+            f"Stage transition for job {job_id}: "
+            f"{len(follow_up)} follow-up task(s) enqueued"
+        )
+        return True
 
     async def _call_on_result(self, raw: str, result: ResultEnvelope) -> None:
         """
@@ -494,78 +572,25 @@ class Coordinator:
             raw, f"on_result: {type(last_error).__name__}: {last_error}"
         )
 
-    async def _handle_completed(self, result: ResultEnvelope) -> None:
-        """Process a successfully completed task result."""
-        job_id = result.job_id
-
-        # Re-check: the job may have been cancelled (tracker cleaned up)
-        # while on_result was being awaited.
-        if not self._tracker.is_tracked(job_id):
-            logger.info(
-                f"Dropping result for task {result.task_id}: job {job_id} "
-                f"stopped being tracked while on_result was running."
-            )
-            return
-
-        # Stage result — spawn follow-up tasks
-        if result.stage_output is not None:
-            try:
-                follow_up = self._stage_handler(result)
-            except Exception as e:
-                logger.error(
-                    f"stage_handler failed for task {result.task_id}: {e}"
-                )
-                follow_up = None
-
-            if follow_up:
-                # Replace this task's slot with N new tasks
-                self._tracker.register(job_id, len(follow_up))
-                for envelope in follow_up:
-                    await self._task_queue.push(
-                        envelope.task_id,
-                        envelope.to_dict(),
-                        priority=envelope.priority,
-                    )
-                logger.info(
-                    f"Stage transition for job {job_id}: "
-                    f"{len(follow_up)} follow-up task(s) enqueued"
-                )
-
-        # Record output if present (stage tasks may have no final output)
-        if result.output:
-            self._tracker.record_result(job_id, result.output)
-
-        remaining = self._tracker.decrement(job_id)
-        if remaining is None:
-            logger.warning(
-                f"Job {job_id} finalised mid-handling for task "
-                f"{result.task_id} — dropping without re-finalising."
-            )
-            return
-
-        logger.info(
-            f"Task {result.task_id} completed. "
-            f"Job {job_id}: {remaining} task(s) remaining"
-        )
-
-        if remaining == 0:
-            await self._finalise_job(job_id)
-
     async def _finalise_job(self, job_id: str) -> None:
-        """Mark a job completed or failed based on accumulated results."""
-        results = self._tracker.get_results(job_id)
+        """
+        Mark a job completed if any task succeeded, otherwise failed.
 
-        # Write to the store BEFORE dropping tracker state. If the store
-        # raises, the job is still tracked, so the requeued result can
-        # finalise it on the retry instead of being dropped as untracked.
-        if results:
-            await self._store.mark_completed(job_id, results)
-            logger.info(f"Job {job_id} completed with {len(results)} result(s)")
+        Writes the store BEFORE clearing tracker state. If the store raises,
+        the job is still tracked, and the requeued result finalises it on
+        the retry instead of being dropped as untracked.
+        """
+        stats = await self._tracker.stats(job_id)
+        if stats["succeeded"]:
+            await self._store.mark_completed(job_id, stats)
+            logger.info(f"Job {job_id} completed: {stats}")
         else:
-            await self._store.mark_failed(job_id, "All tasks failed or produced no output")
-            logger.error(f"Job {job_id} failed — no results collected")
+            await self._store.mark_failed(
+                job_id, f"All {stats['exhausted']} task(s) exhausted their retries"
+            )
+            logger.error(f"Job {job_id} failed: {stats}")
 
-        self._tracker.cleanup(job_id)
+        await self._tracker.cleanup(job_id)
 
     async def _sleep(self, seconds: float) -> bool:
         """
