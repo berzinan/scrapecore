@@ -36,7 +36,8 @@ def _make_coordinator(
 ) -> Coordinator:
     return Coordinator(
         redis=fake_redis,
-        job_store_adapter=JobStoreAdapter(store),
+        job_store_adapter=kwargs.pop("job_store_adapter", None) or JobStoreAdapter(store),
+        on_result=kwargs.pop("on_result", None),
         task_factory=task_factory,
         stage_handler=stage_handler,
         namespace=namespace,
@@ -381,6 +382,249 @@ async def test_stage_output_triggers_stage_handler_and_enqueues_followups(fake_r
 
     assert store["job-1"]["status"] == "completed"
     assert store["job-1"]["results"] == [{"final": "data"}]
+
+
+# ── on_result hook ───────────────────────────────────────────────────────────
+
+def _factory_for(task_ids):
+    def task_factory(job):
+        return [
+            TaskEnvelope(job_id=job["job_id"], task_id=tid, parser_key="p", payload={})
+            for tid in task_ids
+        ]
+    return task_factory
+
+
+async def _drive_job(coordinator, fake_redis, namespace, n_tasks, results, until, timeout=3.0):
+    """Start the coordinator, wait for n_tasks to be dispatched, push results, wait for until()."""
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        for _ in range(200):
+            if await task_queue.pending_count() == n_tasks:
+                break
+            await asyncio.sleep(0.01)
+        for r in results:
+            await result_queue.push(r)
+        deadline = asyncio.get_event_loop().time() + timeout
+        while not until():
+            if asyncio.get_event_loop().time() > deadline:
+                pytest.fail("Coordinator did not reach the expected state in time")
+            await asyncio.sleep(0.02)
+    finally:
+        await coordinator.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
+
+
+async def _wait_for_drain(fake_redis, namespace):
+    """Wait until the result queue is empty, plus a beat for the loop to process the last pop."""
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    for _ in range(200):
+        if await result_queue.length() == 0:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+
+
+def _success(task_id, output=None, stage_output=None, job_id="job-1"):
+    return ResultEnvelope.success(
+        task_id=task_id, job_id=job_id, agent_id="agent",
+        retry_count=0, max_retries=3,
+        output=output if output is not None else {}, stage_output=stage_output,
+    )
+
+
+async def test_on_result_called_once_per_completed_result(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1", "t-2"]), on_result=on_result
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 2,
+        [_success("t-1", {"i": 1}), _success("t-2", {"i": 2})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    assert [r.task_id for r in seen] == ["t-1", "t-2"]
+    assert [r.output for r in seen] == [{"i": 1}, {"i": 2}]
+    assert all(r.status == "completed" for r in seen)
+
+
+async def test_on_result_receives_exhausted_results(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), on_result=on_result
+    )
+    exhausted = ResultEnvelope.failure(
+        task_id="t-1", job_id="job-1", agent_id="agent",
+        retry_count=3, max_retries=3, error="boom",
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [exhausted],
+        until=lambda: store["job-1"]["status"] == "failed",
+    )
+
+    assert len(seen) == 1
+    assert seen[0].status == "exhausted"
+    assert seen[0].error == "boom"
+
+
+async def test_on_result_receives_retriable_failures(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), on_result=on_result
+    )
+    failed = ResultEnvelope.failure(
+        task_id="t-1", job_id="job-1", agent_id="agent",
+        retry_count=0, max_retries=3, error="timeout",
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [failed],
+        until=lambda: len(seen) == 1,
+    )
+
+    assert seen[0].status == "failed"
+    # A retriable failure must not finalise the job.
+    assert store["job-1"]["status"] == "running"
+
+
+async def test_on_result_receives_stage_output(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    def stage_handler(result):
+        return [TaskEnvelope(job_id=result.job_id, task_id="t-2",
+                             parser_key="extract", payload={})]
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]),
+        stage_handler=stage_handler, on_result=on_result,
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1,
+        [_success("t-1", stage_output={"brands": ["a", "b"]})],
+        until=lambda: len(seen) == 1,
+    )
+
+    assert seen[0].stage_output == {"brands": ["a", "b"]}
+
+
+async def test_on_result_not_called_for_cancelled_job(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), on_result=on_result
+    )
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        while await task_queue.pending_count() == 0:
+            await asyncio.sleep(0.01)
+        store["job-1"]["status"] = "cancelled"
+        await result_queue.push(_success("t-1", {"i": 1}))
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await coordinator.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
+
+    assert seen == []
+
+
+async def test_on_result_not_called_for_untracked_job(fake_redis, namespace):
+    store = {}  # nothing dispatched, so nothing is tracked
+    seen: list[ResultEnvelope] = []
+
+    async def on_result(result):
+        seen.append(result)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), on_result=on_result
+    )
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await result_queue.push(_success("t-1", {"i": 1}, job_id="ghost-job"))
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await coordinator.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
+
+    assert seen == []
+
+
+async def test_on_result_runs_before_job_is_finalised(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    events: list[str] = []
+
+    class RecordingStore(JobStoreAdapter):
+        async def mark_completed(self, job_id, results):
+            events.append("mark_completed")
+            await super().mark_completed(job_id, results)
+
+    async def on_result(result):
+        await asyncio.sleep(0.05)  # simulate a slow DB write
+        events.append(f"hook:{result.task_id}")
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]),
+        job_store_adapter=RecordingStore(store), on_result=on_result,
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    assert events == ["hook:t-1", "mark_completed"]
+
+
+async def test_on_result_exception_does_not_break_job(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    calls: list[str] = []
+
+    async def on_result(result):
+        calls.append(result.task_id)
+        if result.task_id == "t-1":
+            raise RuntimeError("db is down")
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1", "t-2"]), on_result=on_result
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 2,
+        [_success("t-1", {"i": 1}), _success("t-2", {"i": 2})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    # The loop survived the first failure and processed the second result.
+    assert calls == ["t-1", "t-2"]
+    # Coordinator bookkeeping is unaffected by the hook failure.
+    assert sorted(r["i"] for r in store["job-1"]["results"]) == [1, 2]
 
 
 # ── recovery_loop ────────────────────────────────────────────────────────────

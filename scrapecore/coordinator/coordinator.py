@@ -15,16 +15,22 @@ Consumer integration:
         - TaskEnvelopes     (built by a consumer-supplied task factory)
         - ResultEnvelopes   (built by agents)
 
-    The consumer supplies two callables:
+    The consumer supplies two required callables and one optional hook:
 
     task_factory(job: dict) -> list[TaskEnvelope]
         Given a job record, return the first-stage TaskEnvelopes to enqueue.
-      
 
     stage_handler(result: ResultEnvelope) -> list[TaskEnvelope] | None
         Given a completed result that contains stage_output, return the
         next-stage TaskEnvelopes to enqueue, or None if this is a final result.
         For single-stage sites: always return None.
+
+    on_result(result: ResultEnvelope) -> Awaitable[None]   (optional)
+        Awaited once per result for a live, tracked job, before the
+        coordinator updates its own job state. Use it for per-task side
+        effects such as persisting output or updating progress.
+        Delivery is at-least-once: the same task may be reported twice,
+        so the hook is idempotent. Exceptions are logged and swallowed.
 
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
@@ -36,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
@@ -110,8 +116,9 @@ class _JobTracker:
         - The accumulated result dicts as they arrive
 
     Not persisted — lives only in coordinator memory. If the coordinator
-    restarts mid-job, outstanding tasks will be recovered by the stale
-    task mechanism and their results re-submitted.
+    restarts mid-job, this state is lost: the job stays "running" in the
+    store and every later result for it is dropped as untracked. Stale-task
+    recovery does NOT cover this case.
     """
 
     def __init__(self) -> None:
@@ -178,6 +185,11 @@ class Coordinator:
         recovery_interval:  Seconds between stale task recovery sweeps.
         stale_task_timeout: Seconds a task can sit in processing before recovery.
         heartbeat_interval: Seconds between coordinator heartbeat writes.
+        on_result:          Optional async callable(ResultEnvelope) -> None.
+                            Awaited for every result of a live, tracked job
+                            (all statuses), before job state is updated.
+                            Must be idempotent. Exceptions are logged and
+                            do not affect job bookkeeping.
     """
 
     def __init__(
@@ -191,6 +203,7 @@ class Coordinator:
         recovery_interval: float = 30.0,
         stale_task_timeout: float = 60.0,
         heartbeat_interval: float = 10.0,
+        on_result: Optional[Callable[[ResultEnvelope], Awaitable[None]]] = None,
     ) -> None:
         self._redis = redis
         self._store = job_store_adapter
@@ -201,6 +214,7 @@ class Coordinator:
         self._recovery_interval = recovery_interval
         self._stale_task_timeout = stale_task_timeout
         self._heartbeat_interval = heartbeat_interval
+        self._on_result = on_result
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
@@ -328,6 +342,8 @@ class Coordinator:
         Drain the result queue and update job state.
 
         For each ResultEnvelope:
+            - job cancelled or no longer tracked → drop (no hook, no state change)
+            - otherwise → await on_result, then dispatch on status:
             - "completed" with stage_output → call stage_handler, enqueue more tasks
             - "completed" without stage_output → record output, decrement counter
             - "failed" → task will be retried (agent already re-enqueued it)
@@ -347,6 +363,17 @@ class Coordinator:
                     logger.info(f"Dropping result for cancelled job {job_id}")
                     continue
 
+                if not self._tracker.is_tracked(job_id):
+                    logger.warning(
+                        f"Dropping {result.status} result for task "
+                        f"{result.task_id}: job {job_id} is not tracked "
+                        f"(already finalised). This is likely a "
+                        f"duplicate task execution from stale-task recovery."
+                    )
+                    continue
+
+                await self._call_on_result(result)
+
                 if result.status == "completed":
                     await self._handle_completed(result)
 
@@ -360,43 +387,48 @@ class Coordinator:
 
 
                 elif result.status == "exhausted":
-
                     logger.error(
-
                         f"Task {result.task_id} exhausted retries: {result.error}"
-
                     )
-
-                    if not self._tracker.is_tracked(job_id):
-                        logger.warning(
-
-                            f"Dropping exhausted-retry result for task "
-
-                            f"{result.task_id}: job {job_id} already finalised."
-
-                        )
-
-                        continue
-
+                    # decrement() returns None if the job was cancelled while
+                    # on_result was being awaited.
                     remaining = self._tracker.decrement(job_id)
-
                     if remaining == 0:
                         await self._finalise_job(job_id)
 
             except Exception as e:
                 logger.error(f"Result loop error: {e}", exc_info=True)
 
+    async def _call_on_result(self, result: ResultEnvelope) -> None:
+        """
+        Await the consumer's on_result hook, if one was supplied.
+
+        Exceptions are logged and swallowed.
+        The result has already been popped from Redis, so a failed hook means
+        that result's consumer-side effects are lost (not retried).
+        CancelledError is not caught, so shutdown still propagates.
+        """
+        if self._on_result is None:
+            return
+        try:
+            await self._on_result(result)
+        except Exception as e:
+            logger.error(
+                f"on_result hook failed for task {result.task_id} "
+                f"(job {result.job_id}, status={result.status}): {e}. ",
+                exc_info=True,
+            )
+
     async def _handle_completed(self, result: ResultEnvelope) -> None:
         """Process a successfully completed task result."""
         job_id = result.job_id
 
+        # Re-check: the job may have been cancelled (tracker cleaned up)
+        # while on_result was being awaited.
         if not self._tracker.is_tracked(job_id):
-            logger.warning(
+            logger.info(
                 f"Dropping result for task {result.task_id}: job {job_id} "
-                f"is already finalised. This is almost always a duplicate "
-                f"task execution from stale-task recovery racing a slow "
-                f"(not dead) agent — see COORDINATOR_STALE. No job state "
-                f"was modified."
+                f"stopped being tracked while on_result was running."
             )
             return
 
