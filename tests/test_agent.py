@@ -368,3 +368,71 @@ async def test_heartbeat_key_written_and_cleaned_up(fake_redis, namespace):
 
     # After clean shutdown, the heartbeat key should be deleted.
     assert await fake_redis.get(heartbeat_key) is None
+
+async def test_heartbeat_info_reports_busy_then_idle(fake_redis, namespace):
+    """White-box: _heartbeat_info reflects the in-flight parser key while a
+    task is executing, and returns to idle once it finishes."""
+    release = asyncio.Event()
+
+    async def blocked_parser(raw, metadata):
+        await release.wait()
+        return {"done": True}
+
+    agent = _make_agent(fake_redis, namespace, {"site.parse": blocked_parser})
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    envelope = TaskEnvelope(
+        job_id="j", parser_key="site.parse",
+        payload={"url": "https://example.com/block"},
+    )
+    await _enqueue(fake_redis, namespace, envelope)
+
+    with aioresponses() as mock:
+        mock.get("https://example.com/block", payload={})
+        runner = asyncio.create_task(agent.start())
+        try:
+            # Wait until the parser is actually blocked inside _execute.
+            for _ in range(100):
+                if agent._current_parser_key is not None:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("agent never entered busy state")
+
+            info = agent._heartbeat_info()
+            assert info["state"] == "busy"
+            assert info["current_parser_key"] == "site.parse"
+
+            release.set()
+
+            for _ in range(100):
+                if agent.tasks_completed >= 1:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                pytest.fail("agent never completed the task")
+        finally:
+            await agent.stop()
+            await asyncio.wait_for(runner, timeout=5.0)
+
+    info = agent._heartbeat_info()
+    assert info["state"] == "idle"
+    assert info["current_parser_key"] is None
+    assert info["tasks_completed"] == 1
+    assert info["tasks_failed"] == 0
+
+    result = await result_queue.pop(timeout=1.0)
+    assert result is not None and result.status == "completed"
+
+
+async def test_heartbeat_info_advertises_registered_parsers(fake_redis, namespace):
+    registry = {
+        "site.b": lambda raw, md: {},
+        "site.a": lambda raw, md: {},
+        "site.c": lambda raw, md: {},
+    }
+    agent = _make_agent(fake_redis, namespace, registry)
+
+    info = agent._heartbeat_info()
+    assert info["parsers"] == ["site.a", "site.b", "site.c"]
+    assert agent._current_parser_key is None

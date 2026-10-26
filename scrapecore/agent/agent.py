@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 import time
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any, Callable, Optional
 import redis.asyncio as aioredis
 
@@ -14,10 +17,16 @@ from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
+from scrapecore.queue.presence import AgentPresence
 from scrapecore.plugins.auth import BaseAuth
 
 logger = logging.getLogger(__name__)
 ParserFn = Callable[[Any, dict], Any]
+
+try:
+    _SCRAPECORE_VERSION = _pkg_version("scrapecore")
+except PackageNotFoundError: # running from a source tree, not installed
+    _SCRAPECORE_VERSION = "unknown"
 
 # Backoff sequence (seconds) for 429 / 5xx retries within a single task execution.
 # After all attempts exhaust, the failure surfaces to the queue-level retry
@@ -92,6 +101,7 @@ class Agent:
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
+        self._presence = AgentPresence(redis, namespace)
 
         self._stop_event = asyncio.Event()
 
@@ -100,6 +110,10 @@ class Agent:
 
         self.tasks_completed = 0
         self.tasks_failed = 0
+
+        self._host = socket.gethostname()
+        self._started_at = time.time()
+        self._current_parser_key: Optional[str] = None
 
         self._stage_counts: dict[str, int] = {}
         self._stage_started_at: Optional[float] = None
@@ -220,7 +234,7 @@ class Agent:
             while True:
                 await asyncio.sleep(20)
                 await self._task_queue.renew_claim(envelope.task_id)
-
+        self._current_parser_key = envelope.parser_key
         renew_task = asyncio.create_task(_renew_loop())
         try:
             await self._rate_limit(url, envelope.parser_key)
@@ -309,6 +323,7 @@ class Agent:
                 stage_output=stage_output,
             )
         finally:
+            self._current_parser_key = None
             renew_task.cancel()
             try:
                 await renew_task
@@ -347,11 +362,10 @@ class Agent:
 
     async def _heartbeat_loop(self) -> None:
         """TODO: Docstring"""
-        key    = f"scrapecore:{self._namespace}:heartbeat:{self.agent_id}"
         expiry = int(self._heartbeat_interval * 3)
 
         while not self._stop_event.is_set():
-            await self._redis.set(key, str(time.time()), ex=expiry)
+            await self._presence.beat(self.agent_id, self._heartbeat_info(), expiry)
             logger.debug(f"Heartbeat written for agent {self.agent_id!r}")
             try:
                 await asyncio.wait_for(
@@ -361,9 +375,22 @@ class Agent:
             except asyncio.TimeoutError:
                 pass
 
-        await self._redis.delete(key)
+        await self._presence.remove(self.agent_id)
         logger.debug(f"Heartbeat key deleted for agent {self.agent_id!r}")
 
+    def _heartbeat_info(self) -> dict[str, Any]:
+        """TODO: Docstring"""
+        return {
+            "host": self._host,
+            "pid": os.getpid(),
+            "version": _SCRAPECORE_VERSION,
+            "started_at": self._started_at,
+            "state": "busy" if self._current_parser_key else "idle",
+            "current_parser_key": self._current_parser_key,
+            "parsers": sorted(self._registry),
+            "tasks_completed": self.tasks_completed,
+            "tasks_failed": self.tasks_failed,
+        }
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict[str, Any]:

@@ -44,6 +44,7 @@ from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
+from scrapecore.queue.presence import AgentPresence
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,7 @@ class Coordinator:
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
+        self._presence = AgentPresence(redis, namespace)
         self._tracker = _JobTracker()
 
         self._stop_event = asyncio.Event()
@@ -249,6 +251,16 @@ class Coordinator:
         self._tracker.cleanup(job_id)
         removed = await self._task_queue.cancel_job_tasks(job_id)
         return removed
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        """
+        Agents with a live heartbeat, sorted by agent_id.
+
+        Presence is key existence (TTL-driven), not last_seen field, which
+        carries agent's own clock.
+        state is "idle" or "busy"
+        """
+        return await self._presence.list_online()
 
     # ── Loop 1: dispatch ──────────────────────────────────────────────────────
 
