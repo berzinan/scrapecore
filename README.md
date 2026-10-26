@@ -329,7 +329,43 @@ job — call `await limiter.acquire(domain, limit, window_seconds)` from a
 custom subclass or middleware.)
 
 ---
+## Agent presence
 
+Each agent publishes a JSON heartbeat to Redis every
+`heartbeat_interval` seconds (default 10s) under
+`scrapecore:{namespace}:heartbeat:{agent_id}`, with a TTL of 3× the
+interval. Presence is **key existence**, not a field: when an agent
+crashes, sleeps, or loses its Redis connection, the key expires on its own and the agent disappears from the listing. No cleanup code runs.
+
+The payload:
+
+| Field                | Meaning                                                       |
+|----------------------|---------------------------------------------------------------|
+| `agent_id`           | Set from the key on write, not from the payload.              |
+| `last_seen`          | The agent's own clock. **Informational only.**                 |
+| `host`               | `socket.gethostname()` of the agent process.                  |
+| `pid`                | Agent OS pid.                                                 |
+| `version`            | `scrapecore` package version, or `"unknown"` when running from source. |
+| `started_at`         | Agent's own clock at startup.                                 |
+| `state`              | `"idle"` or `"busy"`.                                         |
+| `current_parser_key` | Parser key of the in-flight task, or `null` when idle.        |
+| `parsers`            | Sorted list of registered parser keys. Useful for spotting a mixed-version fleet. |
+| `tasks_completed`    | Lifetime counter.                                             |
+| `tasks_failed`       | Lifetime counter.                                             |
+
+
+Enumerate live agents:
+
+```python
+from scrapecore.coordinator.coordinator import Coordinator
+# or, from the API process (no Coordinator needed):
+from scrapecore.queue.presence import AgentPresence
+from scrapecore.queue.redis_client import create_redis_client
+
+presence = AgentPresence(create_redis_client(), namespace="default")
+agents = await presence.list_online()   # sorted by agent_id
+
+---
 ## Environment variables
 
 The Redis client factory reads these:
@@ -425,6 +461,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 |-------------------------|-----------------------------------------------------------|
 | `Coordinator`           | Polls job store, dispatches tasks, drains results.        |
 | `Agent`                 | Sequential claim/execute/push loop. Scale = more Agents.                     |
+| `AgentPresence`         | Reads/writes Redis heartbeat keys; `list_online()` enumarates live agents. |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
 | `ResultQueue`           | Single Redis list of `ResultEnvelope`s.                   |
 | `TaskEnvelope`          | Unit of work. Carries `parser_key` and consumer payload.  |
