@@ -30,7 +30,15 @@ Consumer integration:
         coordinator updates its own job state. Use it for per-task side
         effects such as persisting output or updating progress.
         Delivery is at-least-once: the same task may be reported twice,
-        so the hook is idempotent. Exceptions are logged and swallowed.
+        so the hook must be idempotent. A failing hook is retried with
+        exponential backoff (hook_max_attempts); if it never succeeds the
+        result is dead-lettered and job bookkeeping continues.
+
+Result delivery:
+    Results are claimed from Redis with claim() and acked only after the
+    hook and job bookkeeping succeed. Any other failure requeues it.
+    Results left in-flight by a crashed coordinator are recovered at the next start().
+    This assumes exactly one coordinator runs per namespace.
 
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
@@ -188,8 +196,13 @@ class Coordinator:
         on_result:          Optional async callable(ResultEnvelope) -> None.
                             Awaited for every result of a live, tracked job
                             (all statuses), before job state is updated.
-                            Must be idempotent. Exceptions are logged and
-                            do not affect job bookkeeping.
+                            Must be idempotent.
+        hook_max_attempts:  Times on_result is tried for one result before it
+                            is dead-lettered and bookkeeping continues.
+        hook_retry_base_delay: Backoff before the 2nd hook attempt, doubled
+                            each retry, capped at 30s.
+        result_retry_delay: Pause after a result is requeued because handling
+                            failed outside the hook (e.g. job store down).
     """
 
     def __init__(
@@ -204,6 +217,9 @@ class Coordinator:
         stale_task_timeout: float = 60.0,
         heartbeat_interval: float = 10.0,
         on_result: Optional[Callable[[ResultEnvelope], Awaitable[None]]] = None,
+        hook_max_attempts: int = 5,
+        hook_retry_base_delay: float = 1.0,
+        result_retry_delay: float = 1.0,
     ) -> None:
         self._redis = redis
         self._store = job_store_adapter
@@ -215,6 +231,9 @@ class Coordinator:
         self._stale_task_timeout = stale_task_timeout
         self._heartbeat_interval = heartbeat_interval
         self._on_result = on_result
+        self._hook_max_attempts = max(1, hook_max_attempts)
+        self._hook_retry_base_delay = hook_retry_base_delay
+        self._result_retry_delay = result_retry_delay
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
@@ -234,6 +253,8 @@ class Coordinator:
         Start all coordinator loops. Blocks until stop() is called.
         """
         logger.info("Coordinator starting")
+        # Results a previous (crashed) coordinator claimed but never acked.
+        await self._result_queue.recover_inflight()
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._dispatch_loop())
             tg.create_task(self._result_loop())
@@ -339,85 +360,139 @@ class Coordinator:
 
     async def _result_loop(self) -> None:
         """
-        Drain the result queue and update job state.
+        Claim results from the queue, handle each one, then ack it.
 
-        For each ResultEnvelope:
+        claim() moves a result into the processing list; it is only removed
+        by ack() after _process_result() returns.
+        If _process_result() raises, the result is requeued and handled
+        again after result_retry_delay. If the process dies mid-handling, the
+        result stays in processing and recover_inflight() returns it to the
+        queue at the next start().
+        """
+        while not self._stop_event.is_set():
+            try:
+                claimed = await self._result_queue.claim(timeout=2.0)
+            except Exception as e:
+                logger.error(f"Result claim failed: {e}", exc_info=True)
+                await self._sleep(self._result_retry_delay)
+                continue
+            if claimed is None:
+                continue
+
+            raw, result = claimed
+            try:
+                await self._process_result(raw, result)
+            except Exception as e:
+                logger.error(
+                    f"Handling result for task {result.task_id} "
+                    f"(job {result.job_id}) failed: {e} — requeueing",
+                    exc_info=True,
+                )
+                try:
+                    await self._result_queue.requeue(raw)
+                except Exception as requeue_err:
+                    # Still in processing; recovered at next start().
+                    logger.error(f"Requeue failed: {requeue_err}", exc_info=True)
+                await self._sleep(self._result_retry_delay)
+                continue
+
+            await self._result_queue.ack(raw)
+
+    async def _process_result(self, raw: str, result: ResultEnvelope) -> None:
+        """
+        Handle one claimed result.
+
             - job cancelled or no longer tracked → drop (no hook, no state change)
-            - otherwise → await on_result, then dispatch on status:
+            - otherwise → on_result (with retries), then dispatch on status:
             - "completed" with stage_output → call stage_handler, enqueue more tasks
             - "completed" without stage_output → record output, decrement counter
             - "failed" → task will be retried (agent already re-enqueued it)
             - "exhausted" → record failure, decrement counter
 
         When a job's outstanding task count reaches zero, finalise it.
+        Raising from here causes the result to be requeued.
         """
-        while not self._stop_event.is_set():
-            try:
-                result = await self._result_queue.pop(timeout=2.0)
-                if result is None:
-                    continue
+        job_id = result.job_id
 
-                job_id = result.job_id
+        if await self._store.is_cancelled(job_id):
+            logger.info(f"Dropping result for cancelled job {job_id}")
+            return
 
-                if await self._store.is_cancelled(job_id):
-                    logger.info(f"Dropping result for cancelled job {job_id}")
-                    continue
+        if not self._tracker.is_tracked(job_id):
+            logger.warning(
+                f"Dropping {result.status} result for task "
+                f"{result.task_id}: job {job_id} is not tracked "
+                f"(already finalised). This is likely a "
+                f"duplicate task execution from stale-task recovery."
+            )
+            return
 
-                if not self._tracker.is_tracked(job_id):
-                    logger.warning(
-                        f"Dropping {result.status} result for task "
-                        f"{result.task_id}: job {job_id} is not tracked "
-                        f"(already finalised). This is likely a "
-                        f"duplicate task execution from stale-task recovery."
-                    )
-                    continue
+        await self._call_on_result(raw, result)
 
-                await self._call_on_result(result)
+        if result.status == "completed":
+            await self._handle_completed(result)
 
-                if result.status == "completed":
-                    await self._handle_completed(result)
+        elif result.status == "failed":
+            # Task will be retried — the agent already re-enqueued it.
+            logger.info(
+                f"Task {result.task_id} failed "
+                f"(attempt {result.retry_count}/{result.max_retries}) "
+                f"— will retry"
+            )
 
-                elif result.status == "failed":
-                    # Task will be retried — the agent already re-enqueued it.
-                    logger.info(
-                        f"Task {result.task_id} failed "
-                        f"(attempt {result.retry_count}/{result.max_retries}) "
-                        f"— will retry"
-                    )
+        elif result.status == "exhausted":
+            logger.error(
+                f"Task {result.task_id} exhausted retries: {result.error}"
+            )
+            # decrement() returns None if the job was cancelled while
+            # on_result was being awaited.
+            remaining = self._tracker.decrement(job_id)
+            if remaining == 0:
+                await self._finalise_job(job_id)
 
-
-                elif result.status == "exhausted":
-                    logger.error(
-                        f"Task {result.task_id} exhausted retries: {result.error}"
-                    )
-                    # decrement() returns None if the job was cancelled while
-                    # on_result was being awaited.
-                    remaining = self._tracker.decrement(job_id)
-                    if remaining == 0:
-                        await self._finalise_job(job_id)
-
-            except Exception as e:
-                logger.error(f"Result loop error: {e}", exc_info=True)
-
-    async def _call_on_result(self, result: ResultEnvelope) -> None:
+    async def _call_on_result(self, raw: str, result: ResultEnvelope) -> None:
         """
-        Await the consumer's on_result hook, if one was supplied.
+        Await the consumer's on_result hook, retrying with exponential backoff.
 
-        Exceptions are logged and swallowed.
-        The result has already been popped from Redis, so a failed hook means
-        that result's consumer-side effects are lost (not retried).
-        CancelledError is not caught, so shutdown still propagates.
+        The result stays in the processing list throughout.
+        After hook_max_attempts failures the result is copied
+        to the dead-letter list and this returns normally.
+
+        Retry sleeps block the result loop.
+        A stop() during backoff raises, so the result is requeued rather
+        than dead-lettered. CancelledError is never caught.
         """
         if self._on_result is None:
             return
-        try:
-            await self._on_result(result)
-        except Exception as e:
-            logger.error(
-                f"on_result hook failed for task {result.task_id} "
-                f"(job {result.job_id}, status={result.status}): {e}. ",
-                exc_info=True,
-            )
+
+        for attempt in range(1, self._hook_max_attempts + 1):
+            try:
+                await self._on_result(result)
+                return
+            except Exception as e:
+                last_error = e
+                if attempt == self._hook_max_attempts:
+                    break
+                delay = min(self._hook_retry_base_delay * 2 ** (attempt - 1), 30.0)
+                logger.warning(
+                    f"on_result hook failed for task {result.task_id} "
+                    f"(attempt {attempt}/{self._hook_max_attempts}): {e} "
+                    f"— retrying in {delay:.1f}s"
+                )
+                if await self._sleep(delay):
+                    raise RuntimeError(
+                        "Coordinator stopping during on_result retry"
+                    ) from e
+
+        logger.error(
+            f"on_result hook failed {self._hook_max_attempts} times for task "
+            f"{result.task_id} (job {result.job_id}, status={result.status}): "
+            f"{last_error}. Result dead-lettered; job bookkeeping continues.",
+            exc_info=last_error,
+        )
+        await self._result_queue.dead_letter(
+            raw, f"on_result: {type(last_error).__name__}: {last_error}"
+        )
 
     async def _handle_completed(self, result: ResultEnvelope) -> None:
         """Process a successfully completed task result."""
@@ -479,14 +554,29 @@ class Coordinator:
     async def _finalise_job(self, job_id: str) -> None:
         """Mark a job completed or failed based on accumulated results."""
         results = self._tracker.get_results(job_id)
-        self._tracker.cleanup(job_id)
 
+        # Write to the store BEFORE dropping tracker state. If the store
+        # raises, the job is still tracked, so the requeued result can
+        # finalise it on the retry instead of being dropped as untracked.
         if results:
             await self._store.mark_completed(job_id, results)
             logger.info(f"Job {job_id} completed with {len(results)} result(s)")
         else:
             await self._store.mark_failed(job_id, "All tasks failed or produced no output")
             logger.error(f"Job {job_id} failed — no results collected")
+
+        self._tracker.cleanup(job_id)
+
+    async def _sleep(self, seconds: float) -> bool:
+        """
+        Sleep for `seconds`, waking early if stop() is called.
+        :return: True if the coordinator is stopping.
+        """
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+        return self._stop_event.is_set()
 
     # ── Loop 3: recovery ──────────────────────────────────────────────────────
 
