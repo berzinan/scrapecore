@@ -1,60 +1,61 @@
 """
 scrapecore/plugins/base.py
 
-Abstract base classes that consumer parsers and output models must implement.
+Contract between the library and consumer parsers.
 
-These classes define the contract between the library and the consumer.
-The library only knows that parsers return something with a to_dict() method,
-and that task builders return something with a to_envelope() method.
+A parser returns a plain, JSON-serializable dict. That dict becomes
+ResultEnvelope.output. To trigger a next stage, wrap the output with
+with_stage_output(), which adds the data the coordinator needs to build
+follow-up tasks:
 
-TODO: Add example
+    class SearchParser(BaseParser):
+        key = "mysite.search"
+
+        def parse(self, raw, metadata):
+            return with_stage_output(
+                {"query": metadata["query"]},          # final output
+                next_parser_key="mysite.detail",       # parser that builds stage 2
+                catalogs=raw["catalogs"],              # data stage 2 needs
+            )
+
+If you want typed models internally (dataclasses, pydantic), convert them
+to a dict before returning; the library only ever sees the dict.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 from scrapecore.models.task import TaskEnvelope
-from scrapecore.models.result import ResultEnvelope
+from scrapecore.models.result import STAGE_OUTPUT_KEY, ResultEnvelope
 
 
-# ── Output base ───────────────────────────────────────────────────────────────
+# ── Stage output helper ───────────────────────────────────────────────────────
 
-class BaseOutput(ABC):
+def with_stage_output(
+    output: dict[str, Any], next_parser_key: str, **stage_data: Any
+) -> dict[str, Any]:
     """
-    Base class for all data objects returned by parsers.
+    Attach stage data to a parser's output, triggering a stage transition.
 
-    The agent calls to_dict() on the parser's return value before
-    putting it into a ResultEnvelope. Subclasses must implement this.
+    The agent strips the stage data out of the output and sends it as
+    ResultEnvelope.stage_output. ParserRegistry.stage_handler then calls
+    build_stage_tasks() on the parser registered under next_parser_key.
 
-    Optionally, subclasses can implement to_stage_output() if they
-    carry intermediate data for a multi-stage pipeline. Returning a
-    non-None value from to_stage_output() causes the agent to populate
-    ResultEnvelope.stage_output, which triggers a stage transition in
-    the coordinator.
+    Args:
+        output:          The final output for this task (may be empty).
+        next_parser_key: Key of the parser whose build_stage_tasks() builds
+                         the follow-up tasks.
+        **stage_data:    JSON-serializable values build_stage_tasks() needs.
+
+    Returns:
+        A new dict; `output` is not modified.
     """
-
-    @abstractmethod
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize this output to a JSON-safe dict.
-        All values must be primitives: str, int, float, bool, None,
-        or nested dicts/lists of the same.
-        """
-        ...
-
-    def to_stage_output(self) -> Optional[dict[str, Any]]:
-        """
-        Return intermediate data for the coordinator to use when building
-        the next stage of tasks. Return None for final-stage outputs.
-
-        Override this in Stage 1 parsers that need to pass data to Stage 2.
-        The returned dict will appear in ResultEnvelope.stage_output.
-
-        #TODO: Example
-        """
-        return None
+    return {
+        **output,
+        STAGE_OUTPUT_KEY: {"next_parser_key": next_parser_key, **stage_data},
+    }
 
 
 # ── Parser base ───────────────────────────────────────────────────────────────
@@ -69,7 +70,8 @@ class BaseParser(ABC):
                Convention: "{site}.{stage}"  e.g. "mysite.endpoint1"
 
         parse: The parsing function. Receives the raw HTTP response and
-               the metadata dict from the task payload. Returns a BaseOutput.
+               the metadata dict from the task payload. Returns a
+               JSON-serializable dict.
 
     Subclasses may define:
         build_tasks: Given a job record dict, return the first-stage
@@ -97,7 +99,7 @@ class BaseParser(ABC):
             )
 
     @abstractmethod
-    def parse(self, raw: Any, metadata: dict[str, Any]) -> BaseOutput:
+    def parse(self, raw: Any, metadata: dict[str, Any]) -> dict[str, Any]:
         """
         Parse a raw HTTP response into a structured output object.
 
@@ -108,9 +110,11 @@ class BaseParser(ABC):
                       anything the task builder put there. 
 
         Returns:
-            A BaseOutput subclass instance. The agent will call to_dict()
-            on it to produce the result payload, and to_stage_output() to
-            check for stage transition data.
+            A JSON-serializable dict: str, int, float, bool, None, and
+            nested dicts/lists of those. It becomes ResultEnvelope.output.
+            Wrap it with with_stage_output() to trigger a next stage.
+            Anything else (an object, a datetime value, a set) fails the
+            task with a TypeError.
         """
         ...
 

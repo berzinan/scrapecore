@@ -48,6 +48,11 @@ from uuid import uuid4
 
 ResultStatus = Literal["completed", "failed", "exhausted"]
 
+#: Key a parser puts in its returned dict to carry stage data. The agent pops
+#: it out of the output and sends it as ResultEnvelope.stage_output.
+#: Parsers should use plugins.base.with_stage_output() rather than this key.
+STAGE_OUTPUT_KEY = "__stage_output__"
+
 
 @dataclass
 class ResultEnvelope:
