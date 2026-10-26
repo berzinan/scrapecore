@@ -379,6 +379,7 @@ The Redis client factory reads these:
 | `REDIS_PASSWORD` | —             |                                          |
 
 ---
+
 ## Job store: bring your own
 
 The default `JobStoreAdapter` wraps an in-memory dict. For anything beyond
