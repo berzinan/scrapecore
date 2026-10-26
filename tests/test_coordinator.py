@@ -7,7 +7,6 @@ import pytest
 from scrapecore.coordinator.coordinator import (
     Coordinator,
     JobStoreAdapter,
-    _JobTracker,
 )
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
@@ -21,7 +20,6 @@ def _pending_job(job_id: str = "job-1", site: str = "mysite") -> dict:
         "job_id": job_id,
         "status": "pending",
         "site": site,
-        "results": None,
         "error": None,
     }
 
@@ -64,39 +62,6 @@ async def _run_until(coordinator: Coordinator, predicate, timeout: float = 3.0) 
     finally:
         await coordinator.stop()
         await asyncio.wait_for(runner, timeout=5.0)
-
-
-# ── _JobTracker (no async) ───────────────────────────────────────────────────
-
-def test_tracker_register_and_decrement():
-    t = _JobTracker()
-    t.register("j", 3)
-    assert t.decrement("j") == 2
-    assert t.decrement("j") == 1
-    assert t.decrement("j") == 0
-
-
-def test_tracker_record_and_get_results():
-    t = _JobTracker()
-    t.register("j", 2)
-    t.record_result("j", {"a": 1})
-    t.record_result("j", {"b": 2})
-    assert t.get_results("j") == [{"a": 1}, {"b": 2}]
-
-
-def test_tracker_decrement_floors_at_zero():
-    t = _JobTracker()
-    t.register("j", 1)
-    t.decrement("j")
-    assert t.decrement("j") == 0
-
-
-def test_tracker_cleanup_removes_state():
-    t = _JobTracker()
-    t.register("j", 1)
-    t.record_result("j", {"a": 1})
-    t.cleanup("j")
-    assert t.get_results("j") == []
 
 
 # ── dispatch_loop ────────────────────────────────────────────────────────────
@@ -242,7 +207,7 @@ async def test_result_loop_completes_single_task_job(fake_redis, namespace):
         await drive
 
     assert store["job-1"]["status"] == "completed"
-    assert store["job-1"]["results"] == [{"value": 42}]
+    assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}
 
 
 async def test_result_loop_finalises_only_after_all_results_arrive(fake_redis, namespace):
@@ -290,7 +255,7 @@ async def test_result_loop_finalises_only_after_all_results_arrive(fake_redis, n
         await asyncio.wait_for(runner, timeout=5.0)
 
     assert store["job-1"]["status"] == "completed"
-    assert sorted(r["i"] for r in store["job-1"]["results"]) == [0, 1, 2]
+    assert store["job-1"]["summary"] == {"succeeded": 3, "exhausted": 0}
 
 
 async def test_result_loop_marks_failed_when_all_tasks_exhausted(fake_redis, namespace):
@@ -384,7 +349,8 @@ async def test_stage_output_triggers_stage_handler_and_enqueues_followups(fake_r
         await asyncio.wait_for(runner, timeout=5.0)
 
     assert store["job-1"]["status"] == "completed"
-    assert store["job-1"]["results"] == [{"final": "data"}]
+    # The stage task was replaced by its follow-up, so only the follow-up counts.
+    assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}
 
 
 # ── on_result hook ───────────────────────────────────────────────────────────
@@ -586,9 +552,9 @@ async def test_on_result_runs_before_job_is_finalised(fake_redis, namespace):
     events: list[str] = []
 
     class RecordingStore(JobStoreAdapter):
-        async def mark_completed(self, job_id, results):
+        async def mark_completed(self, job_id, summary):
             events.append("mark_completed")
-            await super().mark_completed(job_id, results)
+            await super().mark_completed(job_id, summary)
 
     async def on_result(result):
         await asyncio.sleep(0.05)  # simulate a slow DB write
@@ -648,7 +614,7 @@ async def test_on_result_permanent_failure_dead_letters_and_job_completes(fake_r
 
     assert calls == ["t-1", "t-1", "t-1", "t-2"]
     # Bookkeeping still counted t-1, so the job finished.
-    assert sorted(r["i"] for r in store["job-1"]["results"]) == [1, 2]
+    assert store["job-1"]["summary"] == {"succeeded": 2, "exhausted": 0}
 
     dead = await ResultQueue(fake_redis, namespace=namespace).dead_letters()
     assert len(dead) == 1
@@ -714,7 +680,7 @@ async def test_store_error_requeues_result_and_retries(fake_redis, namespace):
 
     assert FlakyStore.failures_left == 0
     assert seen == ["t-1"]  # handled exactly once, after two requeues
-    assert store["job-1"]["results"] == [{"i": 1}]
+    assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}
 
 
 async def test_finalise_store_error_is_retried_not_dropped(fake_redis, namespace):
@@ -723,11 +689,11 @@ async def test_finalise_store_error_is_retried_not_dropped(fake_redis, namespace
     class FlakyFinaliseStore(JobStoreAdapter):
         failures_left = 1
 
-        async def mark_completed(self, job_id, results):
+        async def mark_completed(self, job_id, summary):
             if FlakyFinaliseStore.failures_left:
                 FlakyFinaliseStore.failures_left -= 1
                 raise ConnectionError("job store unreachable")
-            await super().mark_completed(job_id, results)
+            await super().mark_completed(job_id, summary)
 
     coordinator = _make_coordinator(
         fake_redis, namespace, store, _factory_for(["t-1"]),
@@ -762,6 +728,256 @@ async def test_start_recovers_inflight_results(fake_redis, namespace):
     # Recovered to pending, then claimed, handled (dropped: untracked) and acked.
     assert await result_queue.processing_count() == 0
     assert await result_queue.length() == 0
+
+
+# ── persistent state (Redis-backed tracker, atomic job claim) ─────────────────
+
+async def _wait_until(predicate, timeout=3.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        value = predicate()
+        if asyncio.iscoroutine(value):
+            value = await value
+        if value:
+            return
+        if asyncio.get_event_loop().time() > deadline:
+            pytest.fail("Condition not reached in time")
+        await asyncio.sleep(0.02)
+
+
+async def _stop(coordinator, runner):
+    await coordinator.stop()
+    await asyncio.wait_for(runner, timeout=5.0)
+
+
+async def test_duplicate_result_does_not_finish_job_early(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[str] = []
+
+    async def on_result(result):
+        seen.append(result.task_id)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1", "t-2"]), on_result=on_result
+    )
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await _wait_until(lambda: task_queue.pending_count())
+        # t-1 delivered twice: stale recovery racing a slow agent.
+        await result_queue.push(_success("t-1", {"i": 1}))
+        await result_queue.push(_success("t-1", {"i": 1}))
+        await _wait_for_drain(fake_redis, namespace)
+
+        # With the old counter, the duplicate decremented 2 → 0 and finished the job.
+        assert store["job-1"]["status"] == "running"
+
+        await result_queue.push(_success("t-2", {"i": 2}))
+        await _wait_until(lambda: store["job-1"]["status"] == "completed")
+    finally:
+        await _stop(coordinator, runner)
+
+    assert store["job-1"]["summary"] == {"succeeded": 2, "exhausted": 0}
+    assert seen == ["t-1", "t-2"]  # the duplicate never reached the hook
+
+
+async def test_duplicate_stage_result_does_not_duplicate_followups(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    handler_calls: list[str] = []
+
+    def stage_handler(result):
+        handler_calls.append(result.task_id)
+        return [TaskEnvelope(job_id=result.job_id, task_id="t-2",
+                             parser_key="extract", payload={})]
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), stage_handler=stage_handler
+    )
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await _wait_until(lambda: task_queue.pending_count())
+        await task_queue.claim(timeout=1.0)  # an agent takes t-1
+        stage = _success("t-1", stage_output={"brands": ["a"]})
+        await result_queue.push(stage)
+        await result_queue.push(stage)
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await _stop(coordinator, runner)
+
+    assert handler_calls == ["t-1"]
+    assert await task_queue.pending_count() == 1
+
+
+async def test_result_arriving_before_registration_is_not_dropped(fake_redis, namespace):
+    """
+    A fast agent can finish a task while dispatch is still pushing the rest.
+    Force that interleaving: after the first push, deliver t-1's result and
+    yield long enough for the result loop to run before register().
+    """
+    store = {"job-1": _pending_job()}
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1", "t-2"]))
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    original_push = coordinator._task_queue.push
+    pushed: list[str] = []
+
+    async def push_then_race(task_id, payload, priority=0):
+        await original_push(task_id, payload, priority=priority)
+        pushed.append(task_id)
+        if task_id == "t-1":
+            await result_queue.push(_success("t-1", {"i": 1}))
+            await asyncio.sleep(0.3)  # result loop gets a turn here
+
+    coordinator._task_queue.push = push_then_race
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await _wait_until(lambda: pushed == ["t-1", "t-2"])
+        await result_queue.push(_success("t-2", {"i": 2}))
+        await _wait_until(lambda: store["job-1"]["status"] == "completed")
+    finally:
+        await _stop(coordinator, runner)
+
+    assert store["job-1"]["summary"] == {"succeeded": 2, "exhausted": 0}
+
+
+async def test_restarted_coordinator_resumes_running_job(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    factory_calls: list[str] = []
+
+    def task_factory(job):
+        factory_calls.append(job["job_id"])
+        return _factory_for(["t-1", "t-2"])(job)
+
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    first = _make_coordinator(fake_redis, namespace, store, task_factory)
+    runner = asyncio.create_task(first.start())
+    try:
+        await _wait_until(lambda: task_queue.pending_count())
+        await result_queue.push(_success("t-1", {"i": 1}))
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await _stop(first, runner)  # "crash" with t-2 outstanding
+
+    second = _make_coordinator(fake_redis, namespace, store, task_factory)
+    runner = asyncio.create_task(second.start())
+    try:
+        await result_queue.push(_success("t-2", {"i": 2}))
+        await _wait_until(lambda: store["job-1"]["status"] == "completed")
+    finally:
+        await _stop(second, runner)
+
+    # Before: second coordinator had no tracker entry, dropped t-2, job hung.
+    assert store["job-1"]["summary"] == {"succeeded": 2, "exhausted": 0}
+    assert factory_calls == ["job-1"]  # not re-dispatched on restart
+
+
+async def test_restart_handles_result_left_inflight(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    first = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1"]))
+    runner = asyncio.create_task(first.start())
+    try:
+        await _wait_until(lambda: task_queue.pending_count())
+    finally:
+        await _stop(first, runner)
+
+    # Coordinator claimed the result and died before acking it.
+    await result_queue.push(_success("t-1", {"i": 1}))
+    assert await result_queue.claim(timeout=1.0) is not None
+
+    second = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1"]))
+    runner = asyncio.create_task(second.start())
+    try:
+        await _wait_until(lambda: store["job-1"]["status"] == "completed")
+    finally:
+        await _stop(second, runner)
+
+    assert await result_queue.processing_count() == 0
+
+
+async def test_orphaned_running_job_is_redispatched(fake_redis, namespace):
+    # Claimed (running) by a coordinator that died before registering tasks.
+    job = _pending_job()
+    job["status"] = "running"
+    store = {"job-1": job}
+
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1"]))
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}
+
+
+async def test_job_is_claimed_by_only_one_coordinator(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    factory_calls: list[str] = []
+
+    def task_factory(job):
+        factory_calls.append(job["job_id"])
+        return _factory_for(["t-1"])(job)
+
+    a = _make_coordinator(fake_redis, namespace, store, task_factory)
+    b = _make_coordinator(fake_redis, namespace, store, task_factory)
+    runners = [asyncio.create_task(c.start()) for c in (a, b)]
+    try:
+        await asyncio.sleep(0.3)  # several dispatch cycles each
+    finally:
+        for c, r in zip((a, b), runners):
+            await _stop(c, r)
+
+    assert factory_calls == ["job-1"]
+    assert await TaskQueue(fake_redis, namespace=namespace).pending_count() == 1
+
+
+async def test_dispatch_fails_job_with_duplicate_task_ids(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1", "t-1"]))
+    await _run_until(coordinator, lambda: store["job-1"]["status"] == "failed")
+
+    assert "duplicate" in store["job-1"]["error"]
+    assert await TaskQueue(fake_redis, namespace=namespace).pending_count() == 0
+
+
+async def test_finalised_job_leaves_no_tracker_keys(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1"]))
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    keys = await fake_redis.keys(f"scrapecore:{namespace}:job:*")
+    assert keys == []
+    assert not await fake_redis.sismember(f"scrapecore:{namespace}:jobs:active", "job-1")
+
+
+async def test_cancel_job_stops_tracking(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1", "t-2"]))
+    task_queue = TaskQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await _wait_until(lambda: task_queue.pending_count())
+        store["job-1"]["status"] = "cancelled"
+        await coordinator.cancel_job("job-1")
+    finally:
+        await _stop(coordinator, runner)
+
+    assert not await fake_redis.sismember(f"scrapecore:{namespace}:jobs:active", "job-1")
+    assert await fake_redis.keys(f"scrapecore:{namespace}:job:*") == []
 
 
 # ── recovery_loop ────────────────────────────────────────────────────────────

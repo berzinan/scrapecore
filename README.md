@@ -387,16 +387,45 @@ prototyping, subclass it and back it with the database of your choice
 
 ```python
 class JobStoreAdapter:
-    async def get_pending_jobs(self) -> list[dict]: ...
-    async def mark_running(self, job_id: str) -> None: ...
-    async def mark_completed(self, job_id: str, results: list[dict]) -> None: ...
+    async def claim_pending_jobs(self) -> list[dict]: ...   # atomic pending → running
+    async def get_running_jobs(self) -> list[dict]: ...
+    async def mark_completed(self, job_id: str, summary: dict[str, int]) -> None: ...
     async def mark_failed(self, job_id: str, error: str) -> None: ...
     async def is_cancelled(self, job_id: str) -> bool: ...
     async def get(self, job_id: str) -> dict | None: ...
 ```
 
-A `JobRecord` must always have at least: `job_id`, `status`, `results`,
-`error`, plus any fields your `task_factory` reads (`site`, `query`, etc.).
+`claim_pending_jobs` **must be atomic**: a job it returns must never be
+returned to another caller. In SQL that is one statement:
+
+```sql
+UPDATE jobs SET status = 'running' WHERE status = 'pending' RETURNING *;
+```
+
+`mark_completed` receives outcome counts (`{"succeeded": n, "exhausted": m}`),
+not task outputs. Persist outputs per task in `on_result`.
+
+A `JobRecord` must always have at least: `job_id`, `status` (`pending`,
+`running`, `completed`, `failed` or `cancelled`), `error`, plus any fields
+your `task_factory` reads (`site`, `query`, etc.).
+
+### Coordinator state and Redis persistence
+
+Which tasks each running job is still waiting on is stored in Redis
+(`scrapecore:{namespace}:jobs:active` and `scrapecore:{namespace}:job:{id}:*`),
+so a restarted coordinator resumes running jobs where it left off. For this
+to survive a **Redis** restart as well, run Redis with append-only
+persistence and a persistent volume:
+
+```yaml
+redis:
+  image: redis:7-alpine
+  command: ["redis-server", "--appendonly", "yes"]
+  volumes:
+    - redisdata:/data
+```
+
+Run exactly one coordinator per namespace.
 
 ---
 
