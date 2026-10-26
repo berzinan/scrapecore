@@ -296,6 +296,90 @@ async def test_stage_output_extracted_from_parser_return(fake_redis, namespace):
     }
 
 
+# ── Parser contract ──────────────────────────────────────────────────────────
+
+async def _run_single_task(fake_redis, namespace, parser, max_retries=0):
+    """Run one task through `parser` and return its ResultEnvelope."""
+    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    envelope = TaskEnvelope(
+        job_id="j", parser_key="site.parse",
+        payload={"url": "https://example.com/c"}, max_retries=max_retries,
+    )
+    await _enqueue(fake_redis, namespace, envelope)
+    with aioresponses() as mock:
+        mock.get("https://example.com/c", payload={})
+        await _run_agent_until(
+            agent, lambda: agent.tasks_completed + agent.tasks_failed >= 1
+        )
+    return await ResultQueue(fake_redis, namespace=namespace).pop(timeout=1.0)
+
+
+async def test_non_dict_parser_output_fails_task(fake_redis, namespace):
+    class Model:  # e.g. a typed object returned without converting it
+        def to_dict(self):
+            return {"a": 1}
+
+    result = await _run_single_task(fake_redis, namespace, lambda raw, md: Model())
+
+    assert result.status == "exhausted"
+    assert "must return a dict" in result.error
+
+
+async def test_non_json_serializable_output_fails_task_and_agent_survives(
+    fake_redis, namespace
+):
+    import datetime
+
+    calls = []
+
+    def parser(raw, metadata):
+        calls.append(1)
+        if len(calls) == 1:
+            return {"scraped_at": datetime.datetime(2026, 1, 1)}
+        return {"ok": True}
+
+    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    for task_id in ("bad", "good"):
+        await _enqueue(fake_redis, namespace, TaskEnvelope(
+            job_id="j", task_id=task_id, parser_key="site.parse",
+            payload={"url": "https://example.com/c"}, max_retries=0,
+        ))
+
+    with aioresponses() as mock:
+        mock.get("https://example.com/c", payload={}, repeat=True)
+        await _run_agent_until(
+            agent, lambda: agent.tasks_completed + agent.tasks_failed >= 2
+        )
+
+    results = {r.task_id: r for r in [await result_queue.pop(1.0), await result_queue.pop(1.0)]}
+    assert results["bad"].status == "exhausted"
+    assert "JSON-serializable" in results["bad"].error
+    # Before: json.dumps raised inside ResultQueue.push(), outside the run
+    # loop's error handling, so the agent died and never ran "good".
+    assert results["good"].status == "completed"
+
+
+async def test_non_dict_stage_output_fails_task(fake_redis, namespace):
+    def parser(raw, metadata):
+        return {"x": 1, "__stage_output__": ["not", "a", "dict"]}
+
+    result = await _run_single_task(fake_redis, namespace, parser)
+
+    assert result.status == "exhausted"
+    assert "must be a dict" in result.error
+
+
+async def test_parser_return_value_is_not_mutated(fake_redis, namespace):
+    returned = {"kept": 1, "__stage_output__": {"next_parser_key": "site.next"}}
+
+    result = await _run_single_task(fake_redis, namespace, lambda raw, md: returned)
+
+    assert result.status == "completed"
+    assert result.output == {"kept": 1}
+    assert "__stage_output__" in returned  # agent popped from a copy
+
+
 # ── Sync parser ──────────────────────────────────────────────────────────────
 
 async def test_sync_parser_runs_to_completion(fake_redis, namespace):

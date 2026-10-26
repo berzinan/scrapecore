@@ -14,7 +14,7 @@ import redis.asyncio as aioredis
 from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError, ScrapeFailedError
 from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
-from scrapecore.models.result import ResultEnvelope
+from scrapecore.models.result import STAGE_OUTPUT_KEY, ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
 from scrapecore.queue.presence import AgentPresence
@@ -305,13 +305,9 @@ class Agent:
             else:
                 parsed = await loop.run_in_executor(None, parser_fn, raw, metadata)
 
-            if not isinstance(parsed, dict):
-                raise TypeError(
-                    f"Parser {envelope.parser_key!r} must return a dict, "
-                    f"got {type(parsed).__name__}"
-                )
-
-            stage_output = parsed.pop("__stage_output__", None)
+            output, stage_output = self._validate_parser_output(
+                envelope.parser_key, parsed
+            )
 
             return ResultEnvelope.success(
                 task_id=envelope.task_id,
@@ -319,7 +315,7 @@ class Agent:
                 agent_id=self.agent_id,
                 retry_count=envelope.retry_count,
                 max_retries=envelope.max_retries,
-                output=parsed,
+                output=output,
                 stage_output=stage_output,
             )
         finally:
@@ -329,6 +325,47 @@ class Agent:
                 await renew_task
             except asyncio.CancelledError:
                 pass
+
+    @staticmethod
+    def _validate_parser_output(
+        parser_key: str, parsed: Any
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        """
+        Enforce the parser contract and split output from stage data.
+
+        Runs inside _execute, so a violation raises here and becomes an
+        ordinary failed/exhausted result. Without the JSON check, a value
+        like a datetime would only fail later, in ResultQueue.push(), which
+        is outside the run loop's error handling and would kill the agent.
+
+        :return: (output, stage_output). The parser's dict is not mutated.
+        :raises TypeError: on any contract violation.
+        """
+        if not isinstance(parsed, dict):
+            raise TypeError(
+                f"Parser {parser_key!r} must return a dict, "
+                f"got {type(parsed).__name__}"
+            )
+
+        output = dict(parsed)
+        stage_output = output.pop(STAGE_OUTPUT_KEY, None)
+
+        if stage_output is not None and not isinstance(stage_output, dict):
+            raise TypeError(
+                f"Parser {parser_key!r} returned {STAGE_OUTPUT_KEY!r} as "
+                f"{type(stage_output).__name__}; it must be a dict. "
+                f"Use plugins.base.with_stage_output()."
+            )
+
+        try:
+            json.dumps({"output": output, "stage_output": stage_output})
+        except (TypeError, ValueError) as e:
+            raise TypeError(
+                f"Parser {parser_key!r} returned a value that is not "
+                f"JSON-serializable: {e}"
+            ) from e
+
+        return output, stage_output
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
 

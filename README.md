@@ -49,15 +49,10 @@ docker run --rm -p 6379:6379 redis:7-alpine
 There are three things you write as a consumer:
 
 1. **Parsers** — one per HTTP endpoint you scrape. A parser is a function
-   that takes a raw HTTP response and a metadata dict and returns a plain
-   `dict`. Subclass `BaseParser`.
+   that takes a raw HTTP response and a metadata dict and returns a plain,
+   JSON-serializable `dict`. Subclass `BaseParser`.
 
-2. **Output models** (optional) — typed wrappers around the dicts your
-   parsers return. Subclass `BaseOutput` and implement `to_dict()`. You can
-   skip this and return dicts directly; the library only requires that the
-   final value passed back is a dict.
-
-3. **An entry point** — for each site, exactly one parser implements
+2. **An entry point** — for each site, exactly one parser implements
    `build_tasks(job)` to convert a job record into the first batch of
    `TaskEnvelope`s. For multi-stage pipelines, the same or another parser
    implements `build_stage_tasks(result)` to spawn follow-up tasks.
@@ -75,7 +70,7 @@ A complete one-site, single-stage scraper.
 
 ```python
 # myscraper/parsers.py
-from scrapecore.plugins.base import BaseParser, BaseOutput
+from scrapecore.plugins.base import BaseParser
 from scrapecore.models.task import TaskEnvelope
 
 
@@ -105,8 +100,11 @@ class ItemParser(BaseParser):
         ]
 ```
 
-The parser MUST return a plain `dict`. If you want structured outputs,
-subclass `BaseOutput` and call `.to_dict()` yourself before returning.
+The parser MUST return a plain, JSON-serializable `dict` (str, int, float,
+bool, None, and nested dicts/lists of those). If you use typed models
+internally (dataclasses, pydantic), convert to a dict before returning.
+Anything else — an object, a `datetime`, a `set` — fails the task with a
+`TypeError`.
 
 ### 2. Start an agent
 
@@ -220,26 +218,27 @@ application/json`); other content types are passed to the parser as a string.
 ## Multi-stage pipelines
 
 Some sites need a search request whose response drives a second batch of
-detail requests. Express that by having Stage 1 return a `__stage_output__`
-key, then implement `build_stage_tasks` on the parser whose key is named in
-`next_parser_key`.
+detail requests. Express that by wrapping Stage 1's output with
+`with_stage_output()`, then implement `build_stage_tasks` on the parser
+named by `next_parser_key`.
 
 ```python
+from scrapecore.plugins.base import BaseParser, with_stage_output
+
+
 class SearchParser(BaseParser):
     key = "mysite.parse_search"
 
     def parse(self, raw, metadata):
-        catalogs = raw["data"]["catalogs"]
-        return {
-            # final output kept in the job record (can be empty):
-            "search_query": metadata["query"],
-            # data the coordinator uses to build the next stage:
-            "__stage_output__": {
-                "next_parser_key": "mysite.parse_detail",
-                "catalogs":        catalogs,
-                "query":           metadata["query"],
-            },
-        }
+        return with_stage_output(
+            # final output, delivered to on_result like any other (can be empty):
+            {"search_query": metadata["query"]},
+            # parser whose build_stage_tasks() builds the next stage:
+            next_parser_key="mysite.parse_detail",
+            # data build_stage_tasks() needs, available as result.stage_output:
+            catalogs=raw["data"]["catalogs"],
+            query=metadata["query"],
+        )
 
     def build_tasks(self, job):
         return [TaskEnvelope(
@@ -491,11 +490,12 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | `Agent`                 | Sequential claim/execute/push loop. Scale = more Agents.                     |
 | `AgentPresence`         | Reads/writes Redis heartbeat keys; `list_online()` enumarates live agents. |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
-| `ResultQueue`           | Single Redis list of `ResultEnvelope`s.                   |
+| `ResultQueue`           | Two-list Redis queue of `ResultEnvelope`s: claim/ack, requeue, dead-letter. |
+| `JobTracker`            | Redis record of each running job's outstanding tasks.     |
 | `TaskEnvelope`          | Unit of work. Carries `parser_key` and consumer payload.  |
 | `ResultEnvelope`        | Outcome of a single task execution.                       |
 | `BaseParser`            | Consumer-supplied parse + task-building logic.            |
-| `BaseOutput`            | Optional typed wrapper over parser return dicts.          |
+| `with_stage_output()`   | Wraps a parser's output to trigger the next stage.        |
 | `ParserRegistry`        | Maps `parser_key` → parser, routes jobs by `site`.        |
 | `JobStoreAdapter`       | Narrow interface to whatever holds job records.           |
 | `DistributedRateLimiter`| Optional Redis-backed global rate cap per domain.         |
