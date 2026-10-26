@@ -13,6 +13,7 @@ from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
+from scrapecore.queue.presence import AgentPresence
 
 
 def _pending_job(job_id: str = "job-1", site: str = "mysite") -> dict:
@@ -416,3 +417,21 @@ async def test_recovery_loop_delegates_to_task_queue(fake_redis, namespace):
 
     assert await task_queue.pending_count() == 1
     assert await task_queue.processing_count() == 0
+
+
+# ── heartbeat ────────────────────────────────────────────────────────────
+async def test_list_agents_delegates_to_presence(fake_redis, namespace):
+    store = {}
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, task_factory=lambda j: []
+    )
+
+    presence = AgentPresence(fake_redis, namespace=namespace)
+    await presence.beat("agent-x", {"host": "hx", "state": "idle"}, ttl=30)
+    await presence.beat("agent-y", {"host": "hy", "state": "busy"}, ttl=30)
+
+    agents = await coordinator.list_agents()
+
+    assert [a["agent_id"] for a in agents] == ["agent-x", "agent-y"]
+    assert agents[0]["host"] == "hx"
+    assert agents[1]["state"] == "busy"

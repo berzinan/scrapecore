@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 import time
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any, Callable, Optional
 import redis.asyncio as aioredis
 
@@ -14,10 +17,16 @@ from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
+from scrapecore.queue.presence import AgentPresence
 from scrapecore.plugins.auth import BaseAuth
 
 logger = logging.getLogger(__name__)
 ParserFn = Callable[[Any, dict], Any]
+
+try:
+    _SCRAPECORE_VERSION = _pkg_version("scrapecore")
+except PackageNotFoundError: # running from a source tree, not installed
+    _SCRAPECORE_VERSION = "unknown"
 
 # Backoff sequence (seconds) for 429 / 5xx retries within a single task execution.
 # After all attempts exhaust, the failure surfaces to the queue-level retry
@@ -29,10 +38,10 @@ class Agent:
     """
     Remote worker process. Polls the task queue and executes scrape tasks.
 
-    One Agent instance corresponds to one account/session. Throughput scaling
-    is achieved by running multiple Agent instances with distinct credentials,
-    not by adding workers within a single instance. The run loop is a single
-    sequential coroutine: claim → rate-limit → execute → push result.
+    1 Agent instance == 1 account/session.
+    Throughput scaling is achieved by running multiple Agent instances.
+    The run loop is a single sequential coroutine:
+    claim → rate-limit → execute → push result.
 
     Args:
         agent_id:           Unique name for this agent instance.
@@ -40,21 +49,19 @@ class Agent:
         parser_registry:    Dict mapping parser_key strings to callable parsers.
         namespace:          Must match the namespace used by the coordinator.
         rate_limit_config:  Dict mapping parser_key → requests_per_second.
-                            Each key gets its own independent rate bucket so
-                            pipeline stages with different server-side limits
-                            can be tuned independently.
+                            Each key gets its own independent rate bucket.
                             Example:
                                 {
-                                    "autopiter.parse_searchdetails": 0.15,
-                                    "autopiter.parse_getcosts":      0.03,
-                                    "autopiter.parse_appraise":      0.03,
+                                    "mysite.endpoint1": 0.15,
+                                    "mysite.endpoint2": 0.03,
+                                    "mysite.endpoint3": 0.03,
                                 }
                             Parser keys absent from this dict fall back to
-                            1.0 RPS, domain-keyed (conservative default).
+                            1.0 RPS, domain-keyed.
         claim_timeout:      Seconds the run loop blocks on an empty queue.
         heartbeat_interval: Seconds between heartbeat writes to Redis.
         task_timeout:       Total HTTP timeout in seconds.
-                            Ignored if a custom http_backend is provided.
+                            Ignored if custom http_backend is provided.
         proxy:              Proxy URL forwarded to every backend request.
                             Ignored if a custom http_backend is provided.
         http_backend:       HTTP backend. Defaults to AiohttpBackend.
@@ -94,6 +101,7 @@ class Agent:
 
         self._task_queue = TaskQueue(redis, namespace)
         self._result_queue = ResultQueue(redis, namespace)
+        self._presence = AgentPresence(redis, namespace)
 
         self._stop_event = asyncio.Event()
 
@@ -102,6 +110,10 @@ class Agent:
 
         self.tasks_completed = 0
         self.tasks_failed = 0
+
+        self._host = socket.gethostname()
+        self._started_at = time.time()
+        self._current_parser_key: Optional[str] = None
 
         self._stage_counts: dict[str, int] = {}
         self._stage_started_at: Optional[float] = None
@@ -130,9 +142,7 @@ class Agent:
         """
         Single sequential execution loop: claim → execute → push.
 
-        One task is in flight at a time per agent. Multiple accounts →
-        multiple agents → multiple parallel executions, each with its own
-        session and rate limiter state.
+        One task is in flight at a time per agent.
         """
         logger.debug(f"Agent {self.agent_id!r} run loop started")
 
@@ -199,14 +209,11 @@ class Agent:
         """
         Resolve parser → rate-limit → HTTP (with backoff retry) → parse → return.
 
-        Auth headers are re-applied on every retry attempt so a session refresh
-        that fires between attempts is reflected immediately.
+        Auth headers are re-applied on every retry attempt.
 
         A background task renews this task's claim in Redis every 20s for as
-        long as execution is in flight (including HTTP backoff sleeps), so the
-        coordinator's stale-task recovery doesn't mistake a slow-but-alive
-        execution for a dead agent. Cancelled in `finally` regardless of how
-        this method exits.
+        long as execution is in flight (including HTTP backoff sleeps).
+        Cancelled in `finally` regardless of how this method exits.
         """
         payload      = envelope.payload
         url          = payload["url"]
@@ -227,7 +234,7 @@ class Agent:
             while True:
                 await asyncio.sleep(20)
                 await self._task_queue.renew_claim(envelope.task_id)
-
+        self._current_parser_key = envelope.parser_key
         renew_task = asyncio.create_task(_renew_loop())
         try:
             await self._rate_limit(url, envelope.parser_key)
@@ -316,6 +323,7 @@ class Agent:
                 stage_output=stage_output,
             )
         finally:
+            self._current_parser_key = None
             renew_task.cancel()
             try:
                 await renew_task
@@ -329,8 +337,7 @@ class Agent:
         Enforce per-parser-key rate limiting.
 
         Each parser key in rate_limit_config gets its own Lock and timestamp,
-        so searchdetails (0.15 RPS) and appraise (0.03 RPS) run against
-        completely independent buckets and do not block each other.
+        so distinct parsers run against independent buckets and don't block each other.
         """
         from urllib.parse import urlparse
 
@@ -354,11 +361,11 @@ class Agent:
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        key    = f"scrapecore:{self._namespace}:heartbeat:{self.agent_id}"
+        """TODO: Docstring"""
         expiry = int(self._heartbeat_interval * 3)
 
         while not self._stop_event.is_set():
-            await self._redis.set(key, str(time.time()), ex=expiry)
+            await self._presence.beat(self.agent_id, self._heartbeat_info(), expiry)
             logger.debug(f"Heartbeat written for agent {self.agent_id!r}")
             try:
                 await asyncio.wait_for(
@@ -368,12 +375,26 @@ class Agent:
             except asyncio.TimeoutError:
                 pass
 
-        await self._redis.delete(key)
+        await self._presence.remove(self.agent_id)
         logger.debug(f"Heartbeat key deleted for agent {self.agent_id!r}")
 
+    def _heartbeat_info(self) -> dict[str, Any]:
+        """TODO: Docstring"""
+        return {
+            "host": self._host,
+            "pid": os.getpid(),
+            "version": _SCRAPECORE_VERSION,
+            "started_at": self._started_at,
+            "state": "busy" if self._current_parser_key else "idle",
+            "current_parser_key": self._current_parser_key,
+            "parsers": sorted(self._registry),
+            "tasks_completed": self.tasks_completed,
+            "tasks_failed": self.tasks_failed,
+        }
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict[str, Any]:
+        """TODO: Docstring"""
         return {
             "agent_id":        self.agent_id,
             "tasks_completed": self.tasks_completed,

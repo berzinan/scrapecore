@@ -23,20 +23,7 @@ class ParserRegistry:
     and passes it to both the Agent (for execution) and the Coordinator
     (for task/stage factory delegation).
 
-    Example:
-        registry = ParserRegistry()
-        registry.register(SearchParser())
-        registry.register(AppraiseParser())
-
-        # For the agent — callable dict
-        agent = Agent(..., parser_registry=registry.as_callable_dict())
-
-        # For the coordinator — factory functions
-        coordinator = Coordinator(
-            ...,
-            task_factory=registry.task_factory,
-            stage_handler=registry.stage_handler,
-        )
+    TODO: Example
     """
 
     def __init__(self) -> None:
@@ -51,8 +38,8 @@ class ParserRegistry:
         Args:
             parser:           A BaseParser subclass instance.
             entry_point_for:  If this parser is the first stage for a site,
-                              pass the site key here (e.g. "autopiter").
-                              The registry will route jobs with site="autopiter"
+                              pass the site key here (e.g. "mysite").
+                              The registry will route jobs with site="mysite"
                               to this parser's build_tasks().
         """
         if not parser.key:
