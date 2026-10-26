@@ -36,10 +36,9 @@ Consumer integration:
 
 Result delivery:
     Results are claimed from Redis with claim() and acked only after the
-    hook and job bookkeeping succeed. Any other failure while handling a
-    result requeues it. Results left in-flight by a crashed coordinator are
-    recovered at the next start(). This assumes exactly one coordinator
-    runs per namespace.
+    hook and job bookkeeping succeed. Any other failure requeues it.
+    Results left in-flight by a crashed coordinator are recovered at the next start().
+    This assumes exactly one coordinator runs per namespace.
 
 Job store adapter:
     The coordinator interacts with the job store through a narrow interface
@@ -364,8 +363,8 @@ class Coordinator:
         Claim results from the queue, handle each one, then ack it.
 
         claim() moves a result into the processing list; it is only removed
-        by ack() after _process_result() returns. If _process_result() raises
-        (job store unreachable, etc.), the result is requeued and handled
+        by ack() after _process_result() returns.
+        If _process_result() raises, the result is requeued and handled
         again after result_retry_delay. If the process dies mid-handling, the
         result stays in processing and recover_inflight() returns it to the
         queue at the next start().
@@ -455,13 +454,11 @@ class Coordinator:
         """
         Await the consumer's on_result hook, retrying with exponential backoff.
 
-        The result stays in the processing list throughout, so a crash during
-        retries loses nothing. After hook_max_attempts failures the result is
-        copied to the dead-letter list and this returns normally, so job
-        bookkeeping continues and one bad result cannot wedge a job.
+        The result stays in the processing list throughout.
+        After hook_max_attempts failures the result is copied
+        to the dead-letter list and this returns normally.
 
-        Retry sleeps block the result loop on purpose: if the hook fails
-        because its database is down, every other result would fail too.
+        Retry sleeps block the result loop.
         A stop() during backoff raises, so the result is requeued rather
         than dead-lettered. CancelledError is never caught.
         """

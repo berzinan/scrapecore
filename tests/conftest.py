@@ -11,12 +11,11 @@ def _patch_blocking_yields(client: fake_aioredis.FakeRedis) -> None:
 
     fakeredis returns None immediately from BLMOVE on empty lists, which
     means a tight async loop calling it never yields and starves the
-    event loop. The agent's run loop and the coordinator's result loop
-    are both such loops, so we wrap BLMOVE to poll every 10ms until an
-    item arrives or the timeout expires. Like real Redis, it returns as
-    soon as something is pushed rather than sleeping the full timeout.
+    event loop. Wrap BLMOVE to poll every 10ms until an item arrives or
+    the timeout expires. Like real Redis, it returns as soon as something
+    is pushed rather than sleeping the full timeout.
 
-    BRPOP behaves correctly in fakeredis already, so we leave it alone.
+    BRPOP is left as-is.
     """
     original_blmove = client.blmove
 

@@ -3,9 +3,9 @@ scrapecore/queue/result_queue.py
 
 Result queue — agents push ResultEnvelopes here, coordinator drains it.
 
-Uses the same two-list reliability pattern as TaskQueue. The agent has
+Uses the same two-list pattern as TaskQueue. The agent has
 already acknowledged its task by the time it pushes a result, so a result
-that is lost here is lost for good: nothing upstream will regenerate it.
+that is lost here is lost permanently.
 
     claim()  atomically moves a result from pending to processing (BLMOVE).
     ack()    removes it from processing once the coordinator has fully
@@ -17,8 +17,7 @@ processing. recover_inflight() moves it back to pending on the next start.
 This relies on the coordinator being a singleton: at startup, anything in
 processing belongs to a dead predecessor.
 
-Results that can never be handled (corrupt payloads, results whose
-on_result hook keeps failing) are copied to a dead-letter list with the
+Results that can never be handled are copied to a dead-letter list with the
 reason, so they can be inspected or replayed by hand.
 
 Keys:
@@ -45,7 +44,7 @@ class ResultQueue:
     Agents call push() after completing or failing a task.
     The coordinator calls claim() → handle → ack() (or requeue() on failure).
     pop() is a destructive, unacknowledged read kept for tests and tooling;
-    the coordinator must not use it.
+    coordinator must not use it.
     """
 
     def __init__(self, redis: aioredis.Redis, namespace: str = "default") -> None:
@@ -71,7 +70,7 @@ class ResultQueue:
 
         Blocks for up to `timeout` seconds if the queue is empty.
         A corrupt payload is moved straight to the dead-letter list and
-        None is returned, so it can never wedge the processing list.
+        None is returned
 
         :param timeout: Seconds to block waiting for a result.
         :return: (raw, envelope). Pass `raw` back to ack()/requeue().
@@ -109,8 +108,6 @@ class ResultQueue:
         Move a claimed result back to pending so it is handled again.
 
         Atomic (MULTI/EXEC): the result is never in neither list.
-        Pushed to the far end of pending, behind newer results, so a result
-        that keeps failing does not starve the rest of the queue.
         """
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.lrem(self._processing_key, 1, raw)
@@ -122,7 +119,7 @@ class ResultQueue:
         Record a copy of a result that could not be handled.
 
         Does NOT remove it from processing: the caller still ack()s it once
-        job bookkeeping is done, so dead-lettering never blocks a job.
+        job bookkeeping is done.
         """
         await self._redis.lpush(self._dead_key, self._dead_record(raw, reason))
 
@@ -131,8 +128,7 @@ class ResultQueue:
         Move every result in processing back to pending.
 
         Call once at coordinator startup, before the result loop runs.
-        Each move is a single atomic LMOVE, so a crash mid-recovery loses
-        nothing. Relative order of recovered results is not preserved.
+        Relative order of recovered results is not preserved.
 
         :return: Number of results recovered.
         """
