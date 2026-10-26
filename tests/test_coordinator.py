@@ -38,6 +38,9 @@ def _make_coordinator(
         redis=fake_redis,
         job_store_adapter=kwargs.pop("job_store_adapter", None) or JobStoreAdapter(store),
         on_result=kwargs.pop("on_result", None),
+        hook_max_attempts=kwargs.pop("hook_max_attempts", 5),
+        hook_retry_base_delay=kwargs.pop("hook_retry_base_delay", 0.01),
+        result_retry_delay=kwargs.pop("result_retry_delay", 0.01),
         task_factory=task_factory,
         stage_handler=stage_handler,
         namespace=namespace,
@@ -603,17 +606,39 @@ async def test_on_result_runs_before_job_is_finalised(fake_redis, namespace):
     assert events == ["hook:t-1", "mark_completed"]
 
 
-async def test_on_result_exception_does_not_break_job(fake_redis, namespace):
+async def test_on_result_transient_failure_is_retried(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    calls: list[str] = []
+
+    async def on_result(result):
+        calls.append(result.task_id)
+        if len(calls) < 3:
+            raise RuntimeError("db blip")
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]), on_result=on_result
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    assert calls == ["t-1", "t-1", "t-1"]  # failed twice, succeeded on the third try
+    assert await ResultQueue(fake_redis, namespace=namespace).dead_letters() == []
+
+
+async def test_on_result_permanent_failure_dead_letters_and_job_completes(fake_redis, namespace):
     store = {"job-1": _pending_job()}
     calls: list[str] = []
 
     async def on_result(result):
         calls.append(result.task_id)
         if result.task_id == "t-1":
-            raise RuntimeError("db is down")
+            raise RuntimeError("constraint violation")
 
     coordinator = _make_coordinator(
-        fake_redis, namespace, store, _factory_for(["t-1", "t-2"]), on_result=on_result
+        fake_redis, namespace, store, _factory_for(["t-1", "t-2"]),
+        on_result=on_result, hook_max_attempts=3,
     )
     await _drive_job(
         coordinator, fake_redis, namespace, 2,
@@ -621,10 +646,122 @@ async def test_on_result_exception_does_not_break_job(fake_redis, namespace):
         until=lambda: store["job-1"]["status"] == "completed",
     )
 
-    # The loop survived the first failure and processed the second result.
-    assert calls == ["t-1", "t-2"]
-    # Coordinator bookkeeping is unaffected by the hook failure.
+    assert calls == ["t-1", "t-1", "t-1", "t-2"]
+    # Bookkeeping still counted t-1, so the job finished.
     assert sorted(r["i"] for r in store["job-1"]["results"]) == [1, 2]
+
+    dead = await ResultQueue(fake_redis, namespace=namespace).dead_letters()
+    assert len(dead) == 1
+    assert ResultEnvelope.from_json(dead[0]["raw"]).task_id == "t-1"
+    assert "constraint violation" in dead[0]["reason"]
+
+
+async def test_results_are_acked_after_handling(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    coordinator = _make_coordinator(fake_redis, namespace, store, _factory_for(["t-1", "t-2"]))
+    await _drive_job(
+        coordinator, fake_redis, namespace, 2,
+        [_success("t-1", {"i": 1}), _success("t-2", {"i": 2})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    assert await result_queue.length() == 0
+    assert await result_queue.processing_count() == 0
+
+
+async def test_dropped_results_are_acked(fake_redis, namespace):
+    coordinator = _make_coordinator(fake_redis, namespace, {}, _factory_for(["t-1"]))
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await result_queue.push(_success("t-1", {"i": 1}, job_id="ghost-job"))
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await coordinator.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
+
+    # An untracked result is dropped, but must not linger in processing.
+    assert await result_queue.processing_count() == 0
+
+
+async def test_store_error_requeues_result_and_retries(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+    seen: list[str] = []
+
+    class FlakyStore(JobStoreAdapter):
+        failures_left = 2
+
+        async def is_cancelled(self, job_id):
+            # Only fail once the job is running, i.e. in the result loop.
+            if store[job_id]["status"] == "running" and FlakyStore.failures_left:
+                FlakyStore.failures_left -= 1
+                raise ConnectionError("job store unreachable")
+            return await super().is_cancelled(job_id)
+
+    async def on_result(result):
+        seen.append(result.task_id)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]),
+        job_store_adapter=FlakyStore(store), on_result=on_result,
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    assert FlakyStore.failures_left == 0
+    assert seen == ["t-1"]  # handled exactly once, after two requeues
+    assert store["job-1"]["results"] == [{"i": 1}]
+
+
+async def test_finalise_store_error_is_retried_not_dropped(fake_redis, namespace):
+    store = {"job-1": _pending_job()}
+
+    class FlakyFinaliseStore(JobStoreAdapter):
+        failures_left = 1
+
+        async def mark_completed(self, job_id, results):
+            if FlakyFinaliseStore.failures_left:
+                FlakyFinaliseStore.failures_left -= 1
+                raise ConnectionError("job store unreachable")
+            await super().mark_completed(job_id, results)
+
+    coordinator = _make_coordinator(
+        fake_redis, namespace, store, _factory_for(["t-1"]),
+        job_store_adapter=FlakyFinaliseStore(store),
+    )
+    await _drive_job(
+        coordinator, fake_redis, namespace, 1, [_success("t-1", {"i": 1})],
+        until=lambda: store["job-1"]["status"] == "completed",
+    )
+
+    # Before this change, the tracker was cleaned up before mark_completed,
+    # so the retry found the job untracked and it stayed "running" forever.
+    assert store["job-1"]["status"] == "completed"
+
+
+async def test_start_recovers_inflight_results(fake_redis, namespace):
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+    # Simulate a coordinator that crashed after claiming but before acking.
+    await result_queue.push(_success("t-1", {"i": 1}, job_id="job-x"))
+    claimed = await result_queue.claim(timeout=1.0)
+    assert claimed is not None
+    assert await result_queue.processing_count() == 1
+
+    coordinator = _make_coordinator(fake_redis, namespace, {}, _factory_for([]))
+    runner = asyncio.create_task(coordinator.start())
+    try:
+        await _wait_for_drain(fake_redis, namespace)
+    finally:
+        await coordinator.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
+
+    # Recovered to pending, then claimed, handled (dropped: untracked) and acked.
+    assert await result_queue.processing_count() == 0
+    assert await result_queue.length() == 0
 
 
 # ── recovery_loop ────────────────────────────────────────────────────────────
