@@ -126,11 +126,16 @@ def parse(self, raw, metadata):
 Run one of these on every worker machine. Agents only **fetch**: they hold
 no parsers, and send each raw response back for the coordinator to parse.
 
+An agent talks to the server through a **transport**, never to Redis
+directly. `RedisTransport` connects straight to Redis, which suits local
+development and agents inside your own network.
+
 ```python
 # agent_main.py
 import asyncio
 from scrapecore.queue.redis_client import create_redis_client
 from scrapecore.agent.agent import Agent
+from scrapecore.transport import RedisTransport
 
 
 async def main():
@@ -138,8 +143,7 @@ async def main():
 
     agent = Agent(
         agent_id="machine-01",
-        redis=redis,
-        namespace="default",
+        transport=RedisTransport(redis, namespace="default"),
         rate_limit_config={"mysite.parse_item": 2.0},
     )
     await agent.start()
@@ -496,12 +500,16 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
                         │      │(Redis)      │(Redis) │
                         └──────┼─────────────┼────────┘
                                │             │
+                         ┌─────┴─────────────┴─────┐
+                         │  AgentTransport         │
+                         │  (RedisTransport today) │
+                         └─────┬─────────────▲─────┘
               ┌────────────────┼─────────────┼────────────────┐
               │  AGENT (machine-01)          │                │
               │                │             │                │
               │  run loop ◀────┘             │                │
-              │  claim → rate-limit →     push(raw response)  │
-              │  fetch → push                |                │
+              │  claim → rate-limit →   submit(raw response)  │
+              │  fetch → submit              |                │
               │       │                      │                │
               │  auth_provider               │                │
               │  rate_limiter ───────────────┘                │
@@ -512,7 +520,9 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | Component               | Role                                                      |
 |-------------------------|-----------------------------------------------------------|
 | `Coordinator`           | Polls job store, dispatches tasks, drains results.        |
-| `Agent`                 | Sequential claim/fetch/push loop; returns raw responses. Scale = more Agents. |
+| `Agent`                 | Sequential claim/fetch/submit loop; returns raw responses. Scale = more Agents. |
+| `AgentTransport`        | Interface between an agent and the server: claim, renew, submit, heartbeat, leave. |
+| `RedisTransport`        | `AgentTransport` that talks to the Redis queues directly.  |
 | `AgentPresence`         | Reads/writes Redis heartbeat keys; `list_online()` enumarates live agents. |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
 | `ResultQueue`           | Two-list Redis queue of `ResultEnvelope`s: claim/ack, requeue, dead-letter. |

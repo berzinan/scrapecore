@@ -12,8 +12,8 @@ Verifies the BaseAuth <-> Agent wiring contract:
     - Agent without an auth_provider (default None) executes normally.
 
 No Redis, no network. A fake HttpBackend stands in for AiohttpBackend, and
-Agent._execute is called directly — it never touches self._redis, so the
-agent can be constructed with redis=None.
+Agent._execute is called directly — it never touches the transport, so the
+agent can be constructed with transport=None.
 
 This tests scrapecore's side of the contract only. It does NOT require any
 site-specific auth implementation (e.g. autopiter session-cookie refresh) —
@@ -91,8 +91,7 @@ class RecordingAuth(BaseAuth):
 def _make_agent(backend: FakeBackend, auth: BaseAuth | None) -> Agent:
     return Agent(
         agent_id="test-agent",
-        redis=None,                    # _execute never touches self._redis
-        namespace="test",
+        transport=None,                # _execute never touches the transport
         http_backend=backend,
         auth_provider=auth,
     )

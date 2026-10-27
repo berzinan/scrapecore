@@ -12,6 +12,7 @@ from yarl import URL
 
 from scrapecore.agent.agent import Agent
 from scrapecore.http.base import HttpResponse
+from scrapecore.transport import RedisTransport
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
@@ -52,8 +53,7 @@ def _make_agent(fake_redis, namespace, **kwargs) -> Agent:
     kwargs.setdefault("rate_limit_config", {"site.parse": 1000.0})
     return Agent(
         agent_id="test-agent",
-        redis=fake_redis,
-        namespace=namespace,
+        transport=RedisTransport(fake_redis, namespace),
         claim_timeout=0.1,            # fast shutdown
         heartbeat_interval=1.0,       # >= 1s so int(interval * 3) >= 1
         task_timeout=5,
@@ -331,3 +331,60 @@ async def test_heartbeat_info_reports_busy_then_idle(fake_redis, namespace):
 
     result = await result_queue.pop(timeout=1.0)
     assert result is not None and result.status == "completed"
+
+
+# ── Transport independence ───────────────────────────────────────────────────
+
+class _InMemoryTransport:
+    """Minimal AgentTransport with no Redis: a list of tasks, a list of results."""
+
+    def __init__(self, tasks):
+        self.tasks = list(tasks)
+        self.submitted = []
+        self.heartbeats = 0
+        self.left = False
+
+    async def claim(self, timeout):
+        if self.tasks:
+            return self.tasks.pop(0)
+        await asyncio.sleep(min(timeout, 0.05))
+        return None
+
+    async def renew(self, task_id):
+        pass
+
+    async def submit(self, task, result):
+        self.submitted.append((task, result))
+
+    async def heartbeat(self, agent_id, info, ttl):
+        self.heartbeats += 1
+
+    async def leave(self, agent_id):
+        self.left = True
+
+
+async def test_agent_runs_on_any_transport_without_redis():
+    from scrapecore.transport import AgentTransport
+
+    task = TaskEnvelope(job_id="j", parser_key="site.parse",
+                        payload={"url": "https://example.com/t"})
+    transport = _InMemoryTransport([task])
+    assert isinstance(transport, AgentTransport)
+
+    agent = Agent(
+        agent_id="mem-agent",
+        transport=transport,
+        rate_limit_config={"site.parse": 1000.0},
+        claim_timeout=0.1,
+        heartbeat_interval=1.0,
+    )
+    with aioresponses() as mock:
+        mock.get("https://example.com/t", payload={"ok": True})
+        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
+
+    [(submitted_task, result)] = transport.submitted
+    assert submitted_task.task_id == task.task_id
+    assert result.status == "completed"
+    assert result.response["text"] == '{"ok": true}'
+    assert transport.heartbeats >= 1
+    assert transport.left  # leave() called on clean shutdown

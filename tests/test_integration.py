@@ -14,6 +14,7 @@ from aioresponses import aioresponses
 
 from scrapecore.agent.agent import Agent
 from scrapecore.coordinator.coordinator import Coordinator, JobStoreAdapter
+from scrapecore.transport import RedisTransport
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.queue.redis_client import create_redis_client
 
@@ -67,8 +68,7 @@ async def test_full_pipeline_single_stage():
     )
     agent = Agent(
         agent_id="itest-agent",
-        redis=redis,                      # agent only fetches
-        namespace=namespace,
+        transport=RedisTransport(redis, namespace),  # agent only fetches
         claim_timeout=0.5,
         heartbeat_interval=1.0,
     )
