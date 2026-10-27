@@ -22,6 +22,9 @@ from scrapecore.queue.task_queue import TaskQueue
 
 logger = logging.getLogger(__name__)
 
+# BLMOVE timeout 0 blocks forever; never pass it through.
+_MIN_CLAIM_TIMEOUT = 0.01
+
 
 class RedisTransport:
     """
@@ -39,7 +42,15 @@ class RedisTransport:
         self._cancelled_key = f"scrapecore:{namespace}:cancelled_jobs"
 
     async def claim(self, timeout: float) -> Optional[TaskEnvelope]:
-        """Atomically move the next task to processing and return it."""
+        """
+        Atomically move the next task to processing and return it.
+
+        A timeout of 0 means "don't wait" here. Redis's BLMOVE treats 0 as
+        "block forever", so it is raised to a minimal positive wait; this
+        matters because the gateway passes through a timeout chosen by a
+        remote agent.
+        """
+        timeout = max(float(timeout), _MIN_CLAIM_TIMEOUT)
         claimed = await self._task_queue.claim(timeout=timeout)
         if claimed is None:
             return None

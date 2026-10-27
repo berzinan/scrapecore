@@ -456,6 +456,71 @@ This is enforced with a Redis lock
 
 ---
 
+## Remote agents: the gateway
+
+Agents on machines outside your server (employee laptops) must not reach
+Redis. They connect to the **gateway**, a small HTTPS service that runs next
+to the coordinator and performs each queue operation on their behalf. Only
+the gateway's port is exposed; Redis, the database and the coordinator stay
+private.
+
+### On the server
+
+```bash
+# 1. One-time: create a self-signed certificate (needs openssl; on Windows, run in WSL)
+scrapecore-gateway gen-cert --cert gateway-cert.pem --key gateway-key.pem
+#    → prints the certificate fingerprint; agents need it
+
+# 2. Issue a token per agent (shown once; only a hash is stored)
+scrapecore-gateway add-agent laptop-anna
+
+# 3. Run the gateway (same REDIS_* environment variables as the coordinator)
+scrapecore-gateway serve --cert gateway-cert.pem --key gateway-key.pem --port 8443
+```
+
+Manage access later with `revoke-agent NAME`, `list-agents`, and
+`add-agent NAME` again to rotate a token. Add `--min-agent-version X.Y.Z`
+to `serve` to refuse outdated agents (they get HTTP 426 and stop).
+
+### On each agent machine
+
+```python
+from scrapecore.agent.agent import Agent
+from scrapecore.transport import HttpTransport
+
+agent = Agent(
+    agent_id="laptop-anna",
+    transport=HttpTransport(
+        "https://<server-ip>:8443",
+        token="<token from add-agent>",
+        cert_fingerprint="<fingerprint from gen-cert>",
+    ),
+)
+await agent.start()
+```
+
+The agent accepts **only** the certificate with that fingerprint, so no
+domain name or certificate authority is needed and the connection cannot
+be intercepted.
+
+### What the gateway enforces
+
+- **Identity comes from the token.** Results and presence are recorded
+  under the token's agent name, whatever the agent claims to be.
+- **Only the claiming agent can renew or submit a task** (others get 409).
+- **The server's copy of each task is authoritative.** An agent cannot
+  change a task's URL, job or retry count by sending back a modified one.
+- **Parsing stays on the server.** Submitted results may carry only the raw
+  response; any parsed output from an agent is discarded.
+
+### Network resilience
+
+Agents ride out connectivity loss: an unreachable gateway is retried with
+backoff (up to 30s between attempts), a failed submit is retried before
+giving up, and a task whose result never arrives is re-run after stale-task
+recovery. A revoked token or an outdated version stops the agent, with
+`AuthenticationFailed` or `UpgradeRequired` raised from `agent.start()`.
+
 ## Namespaces
 
 Every Redis key is prefixed `scrapecore:{namespace}:...`. Use one namespace
@@ -502,7 +567,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
                                │             │
                          ┌─────┴─────────────┴─────┐
                          │  AgentTransport         │
-                         │  (RedisTransport today) │
+                         │  Redis | HTTPS→gateway  │
                          └─────┬─────────────▲─────┘
               ┌────────────────┼─────────────┼────────────────┐
               │  AGENT (machine-01)          │                │
@@ -523,6 +588,9 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | `Agent`                 | Sequential claim/fetch/submit loop; returns raw responses. Scale = more Agents. |
 | `AgentTransport`        | Interface between an agent and the server: claim, renew, submit, heartbeat, leave. |
 | `RedisTransport`        | `AgentTransport` that talks to the Redis queues directly.  |
+| `HttpTransport`         | `AgentTransport` for remote agents: HTTPS to the gateway, pinned certificate. |
+| `create_gateway_app`    | The gateway: authenticated HTTPS front for the queues.     |
+| `AgentTokenStore`       | Per-agent tokens for the gateway, stored hashed in Redis.  |
 | `AgentPresence`         | Reads/writes Redis heartbeat keys; `list_online()` enumarates live agents. |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
 | `ResultQueue`           | Two-list Redis queue of `ResultEnvelope`s: claim/ack, requeue, dead-letter. |
