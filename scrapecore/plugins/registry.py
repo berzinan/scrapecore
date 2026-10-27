@@ -53,7 +53,7 @@ class ParserRegistry:
     def as_callable_dict(self) -> dict[str, Any]:
         """
         Return a dict mapping parser keys to their parse() callables.
-        Pass this to Agent(..., parser_registry=...).
+        Pass this to Coordinator(..., parsers=...). Agents do not parse.
         """
         return {key: parser.parse for key, parser in self._parsers.items()}
 

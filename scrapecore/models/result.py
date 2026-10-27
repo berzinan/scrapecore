@@ -9,7 +9,17 @@ The result travels through a separate Redis list:
 
 The coordinator polls this list and updates the job store accordingly.
 
-2 outcomes:
+Fetched results (fetch-only agents):
+    Agents do not parse. A successful fetch is sent as
+        status   = "completed"
+        response = {"status", "content_type", "headers", "text", "url"}
+        task     = the originating TaskEnvelope as a dict
+        output   = None
+    The coordinator runs the parser for task["parser_key"] on the response
+    and continues with a parsed envelope (output / stage_output filled in).
+    A completed result with response=None is treated as already parsed.
+
+3 outcomes:
     Success:
         status = "completed"
         output = consumer-defined dict (serialized PriceList, etc.)
@@ -74,6 +84,12 @@ class ResultEnvelope:
                       result. Carried forward so the coordinator can decide
                       whether to retry without re-reading the task.
         max_retries:  Carried forward from the TaskEnvelope.
+        response:     Raw HTTP response from a fetch-only agent:
+                      {"status", "content_type", "headers", "text", "url"}.
+                      None for failures and already-parsed results.
+        task:         The originating TaskEnvelope as a dict. Lets the
+                      coordinator find the parser, pass its metadata, and
+                      re-enqueue the task if parsing asks for a re-fetch.
     """
     task_id:      str
     job_id:       str
@@ -84,6 +100,8 @@ class ResultEnvelope:
     output:       Optional[dict[str, Any]]  = None
     stage_output: Optional[dict[str, Any]]  = None
     error:        Optional[str]             = None
+    response:     Optional[dict[str, Any]]  = None
+    task:         Optional[dict[str, Any]]  = None
     completed_at: str                       = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -111,6 +129,30 @@ class ResultEnvelope:
             max_retries=max_retries,
             output=output,
             stage_output=stage_output,
+        )
+
+    @classmethod
+    def fetched(
+        cls,
+        task: dict[str, Any],
+        agent_id: str,
+        response: dict[str, Any],
+    ) -> ResultEnvelope:
+        """
+        Build the result a fetch-only agent sends after a successful request.
+
+        :param task:     The TaskEnvelope that was executed, as a dict.
+        :param response: {"status", "content_type", "headers", "text", "url"}.
+        """
+        return cls(
+            task_id=task["task_id"],
+            job_id=task["job_id"],
+            agent_id=agent_id,
+            status="completed",
+            retry_count=task.get("retry_count", 0),
+            max_retries=task.get("max_retries", 3),
+            response=response,
+            task=task,
         )
 
     @classmethod

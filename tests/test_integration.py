@@ -34,7 +34,7 @@ async def test_full_pipeline_single_stage():
     store = {
         "job-1": {
             "job_id": "job-1", "status": "pending", "site": "mysite",
-            "results": None, "error": None,
+            "error": None,
         }
     }
 
@@ -48,20 +48,26 @@ async def test_full_pipeline_single_stage():
     def parser(raw, metadata):
         return {"value": raw["v"]}
 
+    outputs = []
+
+    async def on_result(result):
+        outputs.append(result.output)
+
     coordinator = Coordinator(
         redis=redis,
         job_store_adapter=JobStoreAdapter(store),
         task_factory=task_factory,
         stage_handler=lambda r: [],
         namespace=namespace,
+        parsers={"site.parse": parser},   # parsing happens on the coordinator
+        on_result=on_result,
         dispatch_interval=0.1,
         recovery_interval=10.0,
         heartbeat_interval=1.0,
     )
     agent = Agent(
         agent_id="itest-agent",
-        redis=redis,
-        parser_registry={"site.parse": parser},
+        redis=redis,                      # agent only fetches
         namespace=namespace,
         claim_timeout=0.5,
         heartbeat_interval=1.0,
@@ -89,3 +95,4 @@ async def test_full_pipeline_single_stage():
 
     assert store["job-1"]["status"] == "completed"
     assert store["job-1"]["summary"] == {"succeeded": 1, "exhausted": 0}
+    assert outputs == [{"value": 99}]  # fetched on the agent, parsed on the coordinator

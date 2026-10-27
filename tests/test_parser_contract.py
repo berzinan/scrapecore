@@ -1,6 +1,6 @@
-"""Parser contract: with_stage_output() → agent → ParserRegistry.stage_handler."""
+"""Parser contract: with_stage_output() → validation → ParserRegistry.stage_handler."""
 
-from scrapecore.agent.agent import Agent
+from scrapecore.coordinator.parsing import validate_parser_output
 from scrapecore.models.result import STAGE_OUTPUT_KEY, ResultEnvelope
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.plugins import BaseParser, ParserRegistry, with_stage_output
@@ -26,8 +26,8 @@ def test_with_stage_output_allows_empty_output():
     assert out == {STAGE_OUTPUT_KEY: {"next_parser_key": "site.detail"}}
 
 
-def test_agent_validation_splits_helper_output():
-    output, stage = Agent._validate_parser_output(
+def test_validation_splits_helper_output():
+    output, stage = validate_parser_output(
         "site.search",
         with_stage_output({"query": "q"}, next_parser_key="site.detail", catalogs=["a"]),
     )
@@ -67,7 +67,7 @@ def test_helper_output_routes_through_registry_stage_handler():
     registry.register(DetailParser())
 
     parsed = registry.as_callable_dict()["site.search"]({"catalogs": ["a", "b"]}, {"query": "q"})
-    output, stage = Agent._validate_parser_output("site.search", parsed)
+    output, stage = validate_parser_output("site.search", parsed)
     result = ResultEnvelope.success(
         task_id="t", job_id="j", agent_id="a", retry_count=0, max_retries=3,
         output=output, stage_output=stage,
@@ -78,3 +78,13 @@ def test_helper_output_routes_through_registry_stage_handler():
     assert output == {"query": "q"}
     assert [t.payload["metadata"]["catalog"] for t in follow_up] == ["a", "b"]
     assert all(t.parser_key == "site.detail" for t in follow_up)
+
+
+def test_validation_does_not_mutate_parser_return_value():
+    returned = {"kept": 1, STAGE_OUTPUT_KEY: {"next_parser_key": "site.next"}}
+
+    output, stage = validate_parser_output("site.p", returned)
+
+    assert output == {"kept": 1}
+    assert stage == {"next_parser_key": "site.next"}
+    assert STAGE_OUTPUT_KEY in returned  # popped from a copy
