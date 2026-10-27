@@ -3,9 +3,8 @@ scrapecore/transport/http_transport.py
 
 HttpTransport — AgentTransport that talks to the scrapecore gateway over HTTPS.
 
-This is what agents on remote machines use. They never connect to Redis;
-every operation is one HTTPS request to the gateway, authenticated with the
-agent's own bearer token.
+This is what agents on remote machines use. Every operation is one HTTPS request to the gateway,
+authenticated with the agent's own bearer token.
 
 TLS without a domain or certificate authority: the gateway uses a
 self-signed certificate, and the agent is configured with that

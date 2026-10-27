@@ -458,7 +458,7 @@ This is enforced with a Redis lock
 
 ## Remote agents: the gateway
 
-Agents on machines outside your server (employee laptops) must not reach
+Agents on machines outside your server must not reach
 Redis. They connect to the **gateway**, a small HTTPS service that runs next
 to the coordinator and performs each queue operation on their behalf. Only
 the gateway's port is exposed; Redis, the database and the coordinator stay

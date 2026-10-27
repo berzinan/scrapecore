@@ -46,9 +46,7 @@ class RedisTransport:
         Atomically move the next task to processing and return it.
 
         A timeout of 0 means "don't wait" here. Redis's BLMOVE treats 0 as
-        "block forever", so it is raised to a minimal positive wait; this
-        matters because the gateway passes through a timeout chosen by a
-        remote agent.
+        "block forever", so it is raised to a minimal positive wait. 
         """
         timeout = max(float(timeout), _MIN_CLAIM_TIMEOUT)
         claimed = await self._task_queue.claim(timeout=timeout)

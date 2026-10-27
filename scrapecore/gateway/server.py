@@ -3,7 +3,7 @@ scrapecore/gateway/server.py
 
 Gateway — the HTTPS service remote agents talk to instead of Redis.
 
-Agents on employee laptops never reach Redis. They call this gateway, which
+Agents never reach Redis. They call this gateway, which
 authenticates them and performs each operation through RedisTransport on
 their behalf. Redis, Postgres and the coordinator stay private; only the
 gateway's port is exposed.

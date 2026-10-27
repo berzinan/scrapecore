@@ -3,10 +3,7 @@ scrapecore/gateway/tokens.py
 
 AgentTokenStore — per-agent bearer tokens for the gateway.
 
-Each remote agent gets its own random token. Only a SHA-256 hash of the
-token is stored, so someone who can read Redis cannot recover a usable
-token. A fast hash (rather than bcrypt/argon2) is appropriate here because
-tokens are 256 bits of randomness: there is nothing to brute-force.
+Each remote agent gets its own random token. 
 
 Revoking one agent deletes its hash; no other agent is affected.
 

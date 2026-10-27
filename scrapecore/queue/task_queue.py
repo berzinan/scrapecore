@@ -92,10 +92,6 @@ class TaskQueue:
     async def get_payload(self, task_id: str) -> Optional[dict]:
         """
         Return the stored payload of a queued or in-flight task, or None.
-
-        This is the server's own copy. The gateway uses it instead of any
-        task data a remote agent sends, so an agent cannot alter a task
-        (URL, job, retry count) by echoing back a modified one.
         """
         return await self._load_payload(task_id)
 
