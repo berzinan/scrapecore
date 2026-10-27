@@ -92,7 +92,6 @@ def _make_agent(backend: FakeBackend, auth: BaseAuth | None) -> Agent:
     return Agent(
         agent_id="test-agent",
         redis=None,                    # _execute never touches self._redis
-        parser_registry={"dummy.parse": lambda raw, meta: {"ok": True}},
         namespace="test",
         http_backend=backend,
         auth_provider=auth,

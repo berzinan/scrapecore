@@ -20,6 +20,9 @@ follow-up tasks:
 
 If you want typed models internally (dataclasses, pydantic), convert them
 to a dict before returning; the library only ever sees the dict.
+
+Parsers run on the coordinator, not on agents: agents only fetch. Raise
+RetryableParseError for pages that should be fetched again (block pages).
 """
 
 from __future__ import annotations
@@ -56,6 +59,23 @@ def with_stage_output(
         **output,
         STAGE_OUTPUT_KEY: {"next_parser_key": next_parser_key, **stage_data},
     }
+
+
+# ── Parse errors ──────────────────────────────────────────────────────────────
+
+class RetryableParseError(Exception):
+    """
+    Raise from parse() when the page should be fetched again.
+
+    Use it for responses that are transient rather than wrong: a captcha or
+    block page served with HTTP 200, a half-rendered page, a rate-limit
+    notice. The coordinator re-enqueues the task (counting against its
+    max_retries), so another attempt, often on a different agent, fetches it.
+
+    Any other exception from parse() is treated as permanent: the same HTML
+    would fail the same way, so the task is exhausted immediately and the raw
+    response is dead-lettered for re-parsing once the parser is fixed.
+    """
 
 
 # ── Parser base ───────────────────────────────────────────────────────────────

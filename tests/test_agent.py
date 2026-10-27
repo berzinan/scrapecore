@@ -1,4 +1,8 @@
-"""Layer 3 — Agent execution path with mocked HTTP and fake Redis."""
+"""Layer 3 — Agent fetch path with mocked HTTP and fake Redis.
+
+Agents only fetch; parsing is tested on the coordinator side
+(tests/test_server_parsing.py).
+"""
 
 import asyncio
 
@@ -7,6 +11,7 @@ from aioresponses import aioresponses
 from yarl import URL
 
 from scrapecore.agent.agent import Agent
+from scrapecore.http.base import HttpResponse
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
@@ -42,13 +47,12 @@ async def _run_agent_until(agent: Agent, predicate, timeout: float = 3.0) -> Non
         await asyncio.wait_for(runner, timeout=5.0)
 
 
-def _make_agent(fake_redis, namespace, registry, **kwargs) -> Agent:
+def _make_agent(fake_redis, namespace, **kwargs) -> Agent:
     """Replaces old rps=100.0: effectively no local RL."""
     kwargs.setdefault("rate_limit_config", {"site.parse": 1000.0})
     return Agent(
         agent_id="test-agent",
         redis=fake_redis,
-        parser_registry=registry,
         namespace=namespace,
         claim_timeout=0.1,            # fast shutdown
         heartbeat_interval=1.0,       # >= 1s so int(interval * 3) >= 1
@@ -57,13 +61,10 @@ def _make_agent(fake_redis, namespace, registry, **kwargs) -> Agent:
     )
 
 
-# ── Successful task ──────────────────────────────────────────────────────────
+# ── Successful fetch ─────────────────────────────────────────────────────────
 
-async def test_successful_task(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {"parsed": raw["data"], "meta": metadata}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+async def test_successful_fetch_returns_raw_response(fake_redis, namespace):
+    agent = _make_agent(fake_redis, namespace)
     result_queue = ResultQueue(fake_redis, namespace=namespace)
     task_queue = TaskQueue(fake_redis, namespace=namespace)
 
@@ -76,29 +77,69 @@ async def test_successful_task(fake_redis, namespace):
 
     with aioresponses() as mock:
         mock.get("https://example.com/api", payload={"data": "value"})
-        await _run_agent_until(
-            agent,
-            lambda: agent.tasks_completed >= 1,
-        )
+        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
 
     result = await result_queue.pop(timeout=1.0)
     assert result is not None
     assert result.status == "completed"
-    assert result.output == {"parsed": "value", "meta": {"x": 1}}
     assert result.agent_id == "test-agent"
+    assert result.output is None  # agents do not parse
+    assert result.response["status"] == 200
+    assert "application/json" in result.response["content_type"]
+    assert result.response["text"] == '{"data": "value"}'
+    assert result.response["url"] == "https://example.com/api"
+    # The originating task travels with the result, metadata included.
+    assert result.task["task_id"] == envelope.task_id
+    assert result.task["payload"]["metadata"] == {"x": 1}
 
     # Task acknowledged → nothing left in queue
     assert await task_queue.processing_count() == 0
     assert await task_queue.pending_count() == 0
 
+
+async def test_html_body_is_passed_through_as_text(fake_redis, namespace):
+    agent = _make_agent(fake_redis, namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    await _enqueue(fake_redis, namespace, TaskEnvelope(
+        job_id="j", parser_key="site.parse",
+        payload={"url": "https://example.com/page"},
+    ))
+
+    with aioresponses() as mock:
+        mock.get("https://example.com/page", body="<html><b>hi</b></html>",
+                 content_type="text/html")
+        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
+
+    result = await result_queue.pop(timeout=1.0)
+    assert result.response["text"] == "<html><b>hi</b></html>"
+    assert "text/html" in result.response["content_type"]
+
+
+async def test_agent_needs_no_parser_for_any_parser_key(fake_redis, namespace):
+    agent = _make_agent(fake_redis, namespace)
+    result_queue = ResultQueue(fake_redis, namespace=namespace)
+
+    await _enqueue(fake_redis, namespace, TaskEnvelope(
+        job_id="j", parser_key="some.site.nobody.registered",
+        payload={"url": "https://example.com/any"},
+    ))
+
+    with aioresponses() as mock:
+        mock.get("https://example.com/any", payload={})
+        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
+
+    result = await result_queue.pop(timeout=1.0)
+    assert result.status == "completed"
+    assert result.task["parser_key"] == "some.site.nobody.registered"
+
+
 # ── Task cancellation ──────────────────────────────────────────────────────────
+
 async def test_cancelled_job_stops_retries(fake_redis, namespace):
     """When a job is in the cancelled_jobs set, a failed task is acknowledged
     instead of re-enqueued at queue level, so the queue drains."""
-    def parser(raw, metadata):
-        return {}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    agent = _make_agent(fake_redis, namespace)
     result_queue = ResultQueue(fake_redis, namespace=namespace)
     task_queue = TaskQueue(fake_redis, namespace=namespace)
 
@@ -117,7 +158,7 @@ async def test_cancelled_job_stops_retries(fake_redis, namespace):
         mock.get(url, status=500, repeat=True)
         await _run_agent_until(agent, lambda: agent.tasks_failed >= 1, timeout=5.0)
 
-    # Exhausted once, then acknowledged — not retried at the queue level.
+    # Failed once, then acknowledged — not retried at the queue level.
     assert await task_queue.pending_count() == 0
     assert await task_queue.processing_count() == 0
 
@@ -130,13 +171,11 @@ async def test_cancelled_job_stops_retries(fake_redis, namespace):
 
     assert statuses == ["failed"]
 
+
 # ── HTTP errors ──────────────────────────────────────────────────────────────
 
 async def test_http_error_pushes_failed_result_and_retries(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {"parsed": raw}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    agent = _make_agent(fake_redis, namespace)
     result_queue = ResultQueue(fake_redis, namespace=namespace)
     task_queue = TaskQueue(fake_redis, namespace=namespace)
 
@@ -178,11 +217,9 @@ async def test_http_error_pushes_failed_result_and_retries(fake_redis, namespace
     assert await task_queue.pending_count() == 0
     assert await task_queue.processing_count() == 0
 
+
 async def test_http_failure_recovers_within_single_execution(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {"v": 1}
-    
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    agent = _make_agent(fake_redis, namespace)
     result_queue = ResultQueue(fake_redis, namespace=namespace)
     task_queue = TaskQueue(fake_redis, namespace=namespace)
 
@@ -206,6 +243,7 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
     assert result.status == "completed"
     assert result.retry_count == 0
     assert result.error is None
+    assert result.response["text"] == '{"data": "recovered"}'
     assert await result_queue.pop(timeout=0.1) is None
 
     assert agent.tasks_failed == 0
@@ -213,228 +251,26 @@ async def test_http_failure_recovers_within_single_execution(fake_redis, namespa
     assert await task_queue.processing_count() == 0
 
 
-# ── Unknown parser_key ───────────────────────────────────────────────────────
-
-async def test_unknown_parser_key_produces_failure(fake_redis, namespace):
-    agent = _make_agent(fake_redis, namespace, {})  # empty registry
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="missing.parser",
-        payload={"url": "https://example.com"},
-        max_retries=0,
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    await _run_agent_until(agent, lambda: agent.tasks_failed >= 1)
-
-    result = await result_queue.pop(timeout=1.0)
-    assert result is not None
-    assert result.status == "exhausted"
-    assert result.error is not None
-    assert "missing.parser" in result.error
-
-
-# ── Parser raises ────────────────────────────────────────────────────────────
-
-async def test_parser_exception_produces_failure(fake_redis, namespace):
-    def boom(raw, metadata):
-        raise RuntimeError("kaboom")
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": boom})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com"},
-        max_retries=0,
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    with aioresponses() as mock:
-        mock.get("https://example.com", payload={"data": "x"})
-        await _run_agent_until(agent, lambda: agent.tasks_failed >= 1)
-
-    result = await result_queue.pop(timeout=1.0)
-    assert result is not None
-    assert result.status == "exhausted"
-    assert "kaboom" in result.error
-
-# ── Stage output ─────────────────────────────────────────────────────────────
-
-async def test_stage_output_extracted_from_parser_return(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {
-            "kept": "value",
-            "__stage_output__": {
-                "next_parser_key": "site.next",
-                "items": [1, 2, 3],
-            },
-        }
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com/s"},
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    with aioresponses() as mock:
-        mock.get("https://example.com/s", payload={})
-        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
-
-    result = await result_queue.pop(timeout=1.0)
-    assert result is not None
-    assert result.status == "completed"
-    assert result.output == {"kept": "value"}
-    assert "__stage_output__" not in result.output
-    assert result.stage_output == {
-        "next_parser_key": "site.next",
-        "items": [1, 2, 3],
-    }
-
-
-# ── Parser contract ──────────────────────────────────────────────────────────
-
-async def _run_single_task(fake_redis, namespace, parser, max_retries=0):
-    """Run one task through `parser` and return its ResultEnvelope."""
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com/c"}, max_retries=max_retries,
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-    with aioresponses() as mock:
-        mock.get("https://example.com/c", payload={})
-        await _run_agent_until(
-            agent, lambda: agent.tasks_completed + agent.tasks_failed >= 1
-        )
-    return await ResultQueue(fake_redis, namespace=namespace).pop(timeout=1.0)
-
-
-async def test_non_dict_parser_output_fails_task(fake_redis, namespace):
-    class Model:  # e.g. a typed object returned without converting it
-        def to_dict(self):
-            return {"a": 1}
-
-    result = await _run_single_task(fake_redis, namespace, lambda raw, md: Model())
-
-    assert result.status == "exhausted"
-    assert "must return a dict" in result.error
-
-
-async def test_non_json_serializable_output_fails_task_and_agent_survives(
-    fake_redis, namespace
-):
-    import datetime
-
-    calls = []
-
-    def parser(raw, metadata):
-        calls.append(1)
-        if len(calls) == 1:
-            return {"scraped_at": datetime.datetime(2026, 1, 1)}
-        return {"ok": True}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-    for task_id in ("bad", "good"):
-        await _enqueue(fake_redis, namespace, TaskEnvelope(
-            job_id="j", task_id=task_id, parser_key="site.parse",
-            payload={"url": "https://example.com/c"}, max_retries=0,
-        ))
-
-    with aioresponses() as mock:
-        mock.get("https://example.com/c", payload={}, repeat=True)
-        await _run_agent_until(
-            agent, lambda: agent.tasks_completed + agent.tasks_failed >= 2
-        )
-
-    results = {r.task_id: r for r in [await result_queue.pop(1.0), await result_queue.pop(1.0)]}
-    assert results["bad"].status == "exhausted"
-    assert "JSON-serializable" in results["bad"].error
-    # Before: json.dumps raised inside ResultQueue.push(), outside the run
-    # loop's error handling, so the agent died and never ran "good".
-    assert results["good"].status == "completed"
-
-
-async def test_non_dict_stage_output_fails_task(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {"x": 1, "__stage_output__": ["not", "a", "dict"]}
-
-    result = await _run_single_task(fake_redis, namespace, parser)
-
-    assert result.status == "exhausted"
-    assert "must be a dict" in result.error
-
-
-async def test_parser_return_value_is_not_mutated(fake_redis, namespace):
-    returned = {"kept": 1, "__stage_output__": {"next_parser_key": "site.next"}}
-
-    result = await _run_single_task(fake_redis, namespace, lambda raw, md: returned)
-
-    assert result.status == "completed"
-    assert result.output == {"kept": 1}
-    assert "__stage_output__" in returned  # agent popped from a copy
-
-
-# ── Sync parser ──────────────────────────────────────────────────────────────
-
-async def test_sync_parser_runs_to_completion(fake_redis, namespace):
-    def sync_parser(raw, metadata):
-        # Plain sync function — must work without being async.
-        return {"sync": True, "echo": raw.get("hello")}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": sync_parser})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com/sync"},
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    with aioresponses() as mock:
-        mock.get("https://example.com/sync", payload={"hello": "world"})
-        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
-
-    result = await result_queue.pop(timeout=1.0)
-    assert result is not None
-    assert result.output == {"sync": True, "echo": "world"}
-
-
-async def test_async_parser_runs_to_completion(fake_redis, namespace):
-    async def async_parser(raw, metadata):
-        await asyncio.sleep(0)
-        return {"async": True}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": async_parser})
-    result_queue = ResultQueue(fake_redis, namespace=namespace)
-
-    envelope = TaskEnvelope(
-        job_id="j", parser_key="site.parse",
-        payload={"url": "https://example.com/async"},
-    )
-    await _enqueue(fake_redis, namespace, envelope)
-
-    with aioresponses() as mock:
-        mock.get("https://example.com/async", payload={})
-        await _run_agent_until(agent, lambda: agent.tasks_completed >= 1)
-
-    result = await result_queue.pop(timeout=1.0)
-    assert result is not None
-    assert result.output == {"async": True}
-
-
 # ── Heartbeat ────────────────────────────────────────────────────────────────
 
-async def test_heartbeat_key_written_and_cleaned_up(fake_redis, namespace):
-    def parser(raw, metadata):
-        return {}
+class _BlockingBackend:
+    """HttpBackend that holds every request until `release` is set."""
 
-    agent = _make_agent(fake_redis, namespace, {"site.parse": parser})
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def request(self, method, url, *, headers=None, params=None, body=None, proxy=None):
+        self.entered.set()
+        await self.release.wait()
+        return HttpResponse(status=200, content_type="text/html", text="ok", headers={})
+
+    async def close(self) -> None:
+        pass
+
+
+async def test_heartbeat_key_written_and_cleaned_up(fake_redis, namespace):
+    agent = _make_agent(fake_redis, namespace)
     heartbeat_key = f"scrapecore:{namespace}:heartbeat:test-agent"
 
     runner = asyncio.create_task(agent.start())
@@ -453,70 +289,45 @@ async def test_heartbeat_key_written_and_cleaned_up(fake_redis, namespace):
     # After clean shutdown, the heartbeat key should be deleted.
     assert await fake_redis.get(heartbeat_key) is None
 
+
 async def test_heartbeat_info_reports_busy_then_idle(fake_redis, namespace):
     """White-box: _heartbeat_info reflects the in-flight parser key while a
-    task is executing, and returns to idle once it finishes."""
-    release = asyncio.Event()
-
-    async def blocked_parser(raw, metadata):
-        await release.wait()
-        return {"done": True}
-
-    agent = _make_agent(fake_redis, namespace, {"site.parse": blocked_parser})
+    fetch is executing, and returns to idle once it finishes."""
+    backend = _BlockingBackend()
+    agent = _make_agent(fake_redis, namespace, http_backend=backend)
     result_queue = ResultQueue(fake_redis, namespace=namespace)
 
-    envelope = TaskEnvelope(
+    await _enqueue(fake_redis, namespace, TaskEnvelope(
         job_id="j", parser_key="site.parse",
         payload={"url": "https://example.com/block"},
-    )
-    await _enqueue(fake_redis, namespace, envelope)
+    ))
 
-    with aioresponses() as mock:
-        mock.get("https://example.com/block", payload={})
-        runner = asyncio.create_task(agent.start())
-        try:
-            # Wait until the parser is actually blocked inside _execute.
-            for _ in range(100):
-                if agent._current_parser_key is not None:
-                    break
-                await asyncio.sleep(0.02)
-            else:
-                pytest.fail("agent never entered busy state")
+    runner = asyncio.create_task(agent.start())
+    try:
+        await asyncio.wait_for(backend.entered.wait(), timeout=3.0)
 
-            info = agent._heartbeat_info()
-            assert info["state"] == "busy"
-            assert info["current_parser_key"] == "site.parse"
+        info = agent._heartbeat_info()
+        assert info["state"] == "busy"
+        assert info["current_parser_key"] == "site.parse"
 
-            release.set()
+        backend.release.set()
 
-            for _ in range(100):
-                if agent.tasks_completed >= 1:
-                    break
-                await asyncio.sleep(0.02)
-            else:
-                pytest.fail("agent never completed the task")
-        finally:
-            await agent.stop()
-            await asyncio.wait_for(runner, timeout=5.0)
+        for _ in range(100):
+            if agent.tasks_completed >= 1:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            pytest.fail("agent never completed the task")
+    finally:
+        await agent.stop()
+        await asyncio.wait_for(runner, timeout=5.0)
 
     info = agent._heartbeat_info()
     assert info["state"] == "idle"
     assert info["current_parser_key"] is None
     assert info["tasks_completed"] == 1
     assert info["tasks_failed"] == 0
+    assert "parsers" not in info  # agents carry no parsers
 
     result = await result_queue.pop(timeout=1.0)
     assert result is not None and result.status == "completed"
-
-
-async def test_heartbeat_info_advertises_registered_parsers(fake_redis, namespace):
-    registry = {
-        "site.b": lambda raw, md: {},
-        "site.a": lambda raw, md: {},
-        "site.c": lambda raw, md: {},
-    }
-    agent = _make_agent(fake_redis, namespace, registry)
-
-    info = agent._heartbeat_info()
-    assert info["parsers"] == ["site.a", "site.b", "site.c"]
-    assert agent._current_parser_key is None

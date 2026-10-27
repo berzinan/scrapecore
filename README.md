@@ -105,29 +105,40 @@ bool, None, and nested dicts/lists of those).
 Anything else — an object, a `datetime`, a `set` — fails the task with a
 `TypeError`.
 
+Parsers run on the **coordinator**, not on agents. When a page should be
+fetched again — a captcha or block page served with HTTP 200 — raise
+`RetryableParseError` and the task is re-queued (counting against
+`max_retries`). Any other exception is treated as permanent: the task is
+exhausted immediately and the fetched result, raw page included, goes to
+the result dead-letter list so it can be re-parsed once the parser is fixed.
+
+```python
+from scrapecore.plugins import RetryableParseError
+
+def parse(self, raw, metadata):
+    if "captcha" in raw:
+        raise RetryableParseError("captcha page")
+    ...
+```
+
 ### 2. Start an agent
 
-Run one of these on every worker machine.
+Run one of these on every worker machine. Agents only **fetch**: they hold
+no parsers, and send each raw response back for the coordinator to parse.
 
 ```python
 # agent_main.py
 import asyncio
 from scrapecore.queue.redis_client import create_redis_client
 from scrapecore.agent.agent import Agent
-from scrapecore.plugins import ParserRegistry
-from myscraper.parsers import ItemParser
 
 
 async def main():
     redis = create_redis_client()
 
-    registry = ParserRegistry()
-    registry.register(ItemParser(), entry_point_for="mysite")
-
     agent = Agent(
         agent_id="machine-01",
         redis=redis,
-        parser_registry=registry.as_callable_dict(),
         namespace="default",
         rate_limit_config={"mysite.parse_item": 2.0},
     )
@@ -139,6 +150,7 @@ asyncio.run(main())
 ### 3. Start the coordinator
 
 Run this on your server, alongside Redis and whatever API submits jobs.
+The coordinator runs the parsers on every fetched response.
 
 ```python
 # coordinator_main.py
@@ -163,6 +175,7 @@ async def main():
         job_store_adapter=JobStoreAdapter(JOB_STORE),
         task_factory=registry.task_factory,
         stage_handler=registry.stage_handler,
+        parsers=registry.as_callable_dict(),
         namespace="default",
     )
     await coordinator.start()
@@ -347,7 +360,6 @@ The payload:
 | `started_at`         | Agent's own clock at startup.                                 |
 | `state`              | `"idle"` or `"busy"`.                                         |
 | `current_parser_key` | Parser key of the in-flight task, or `null` when idle.        |
-| `parsers`            | Sorted list of registered parser keys. Useful for spotting a mixed-version fleet. |
 | `tasks_completed`    | Lifetime counter.                                             |
 | `tasks_failed`       | Lifetime counter.                                             |
 
@@ -462,7 +474,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
                         │      │                      │
                         │  Coordinator                │
                         │  ├── dispatch_loop          │
-                        │  ├── result_loop            │
+                        │  ├── result_loop (parses)   │
                         │  ├── recovery_loop          │
                         │  └── heartbeat_loop         │
                         │      │            ▲         │
@@ -474,10 +486,10 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
               │  AGENT (machine-01)          │                │
               │                │             │                │
               │  run loop ◀────┘             │                │
-              │  claim → rate-limit →     push(result)        │
-              │  execute → push              |                │
+              │  claim → rate-limit →     push(raw response)  │
+              │  fetch → push                |                │
               │       │                      │                │
-              │  parser_registry             │                │
+              │  auth_provider               │                │
               │  rate_limiter ───────────────┘                │
               │  heartbeat_loop                               │
               └───────────────────────────────────────────────┘
@@ -486,7 +498,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | Component               | Role                                                      |
 |-------------------------|-----------------------------------------------------------|
 | `Coordinator`           | Polls job store, dispatches tasks, drains results.        |
-| `Agent`                 | Sequential claim/execute/push loop. Scale = more Agents.                     |
+| `Agent`                 | Sequential claim/fetch/push loop; returns raw responses. Scale = more Agents. |
 | `AgentPresence`         | Reads/writes Redis heartbeat keys; `list_online()` enumarates live agents. |
 | `TaskQueue`             | Two-list Redis queue with atomic claim and stale recovery.|
 | `ResultQueue`           | Two-list Redis queue of `ResultEnvelope`s: claim/ack, requeue, dead-letter. |

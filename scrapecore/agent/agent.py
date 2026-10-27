@@ -2,26 +2,24 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import socket
 import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 import redis.asyncio as aioredis
 
 from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError, ScrapeFailedError
 from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
-from scrapecore.models.result import STAGE_OUTPUT_KEY, ResultEnvelope
+from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
 from scrapecore.queue.presence import AgentPresence
 from scrapecore.plugins.auth import BaseAuth
 
 logger = logging.getLogger(__name__)
-ParserFn = Callable[[Any, dict], Any]
 
 try:
     _SCRAPECORE_VERSION = _pkg_version("scrapecore")
@@ -36,19 +34,22 @@ _HTTP_RETRY_BACKOFF: tuple[int, ...] = (10, 20, 40, 80, 160)
 
 class Agent:
     """
-    Remote worker process. Polls the task queue and executes scrape tasks.
+    Remote worker process. Polls the task queue and fetches each task's URL.
+
+    Agents do not parse. Successful fetch is returned as a "fetched"
+    ResultEnvelope carrying the raw response.
+    Coordinator runs the parser. Agents therefore no site-specific code beyond auth.
 
     1 Agent instance == 1 account/session.
     Throughput scaling is achieved by running multiple Agent instances.
     The run loop is a single sequential coroutine:
-    claim → rate-limit → execute → push result.
+    claim → rate-limit → fetch → push result.
 
     Args:
         agent_id:           Unique name for this agent instance.
         redis:              Connected async Redis client.
-        parser_registry:    Dict mapping parser_key strings to callable parsers.
         namespace:          Must match the namespace used by the coordinator.
-        rate_limit_config:  Dict mapping parser_key → requests_per_second.
+        rate_limit_config:  Dict mapping a task's parser_key → requests_per_second.
                             Each key gets its own independent rate bucket.
                             Example:
                                 {
@@ -72,7 +73,6 @@ class Agent:
         self,
         agent_id: str,
         redis: aioredis.Redis,
-        parser_registry: dict[str, ParserFn],
         namespace: str = "default",
         rate_limit_config: dict[str, float] | None = None,
         claim_timeout: float = 5.0,
@@ -84,7 +84,6 @@ class Agent:
     ) -> None:
         self.agent_id = agent_id
         self._redis = redis
-        self._registry = parser_registry
         self._namespace = namespace
         self._rate_limit_config: dict[str, float] = rate_limit_config or {}
         self._claim_timeout = claim_timeout
@@ -207,7 +206,7 @@ class Agent:
 
     async def _execute(self, envelope: TaskEnvelope) -> ResultEnvelope:
         """
-        Resolve parser → rate-limit → HTTP (with backoff retry) → parse → return.
+        Rate-limit → HTTP (with backoff retry) → return the raw response.
 
         Auth headers are re-applied on every retry attempt.
 
@@ -221,14 +220,6 @@ class Agent:
         task_headers = dict(payload.get("headers", {}))
         params       = payload.get("params")
         body         = payload.get("body")
-        metadata     = payload.get("metadata", {})
-
-        parser_fn = self._registry.get(envelope.parser_key)
-        if parser_fn is None:
-            raise ValueError(
-                f"No parser registered for key {envelope.parser_key!r}. "
-                f"Registered: {list(self._registry.keys())}"
-            )
 
         async def _renew_loop() -> None:
             while True:
@@ -294,29 +285,16 @@ class Agent:
                 except NetworkError as e:
                     raise ScrapeFailedError(str(e))
 
-            if "application/json" in response.content_type:
-                raw = json.loads(response.text)
-            else:
-                raw = response.text
-
-            loop = asyncio.get_running_loop()
-            if asyncio.iscoroutinefunction(parser_fn):
-                parsed = await parser_fn(raw, metadata)
-            else:
-                parsed = await loop.run_in_executor(None, parser_fn, raw, metadata)
-
-            output, stage_output = self._validate_parser_output(
-                envelope.parser_key, parsed
-            )
-
-            return ResultEnvelope.success(
-                task_id=envelope.task_id,
-                job_id=envelope.job_id,
+            return ResultEnvelope.fetched(
+                task=envelope.to_dict(),
                 agent_id=self.agent_id,
-                retry_count=envelope.retry_count,
-                max_retries=envelope.max_retries,
-                output=output,
-                stage_output=stage_output,
+                response={
+                    "status":       response.status,
+                    "content_type": response.content_type,
+                    "headers":      dict(response.headers or {}),
+                    "text":         response.text,
+                    "url":          url,
+                },
             )
         finally:
             self._current_parser_key = None
@@ -325,45 +303,6 @@ class Agent:
                 await renew_task
             except asyncio.CancelledError:
                 pass
-
-    @staticmethod
-    def _validate_parser_output(
-        parser_key: str, parsed: Any
-    ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
-        """
-        Enforce the parser contract and split output from stage data.
-
-        Runs inside _execute, so a violation raises here and becomes an
-        ordinary failed/exhausted result.
-
-        :return: (output, stage_output). The parser's dict is not mutated.
-        :raises TypeError: on any contract violation.
-        """
-        if not isinstance(parsed, dict):
-            raise TypeError(
-                f"Parser {parser_key!r} must return a dict, "
-                f"got {type(parsed).__name__}"
-            )
-
-        output = dict(parsed)
-        stage_output = output.pop(STAGE_OUTPUT_KEY, None)
-
-        if stage_output is not None and not isinstance(stage_output, dict):
-            raise TypeError(
-                f"Parser {parser_key!r} returned {STAGE_OUTPUT_KEY!r} as "
-                f"{type(stage_output).__name__}; it must be a dict. "
-                f"Use plugins.base.with_stage_output()."
-            )
-
-        try:
-            json.dumps({"output": output, "stage_output": stage_output})
-        except (TypeError, ValueError) as e:
-            raise TypeError(
-                f"Parser {parser_key!r} returned a value that is not "
-                f"JSON-serializable: {e}"
-            ) from e
-
-        return output, stage_output
 
     # ── Rate limiting ─────────────────────────────────────────────────────────
 
@@ -422,7 +361,6 @@ class Agent:
             "started_at": self._started_at,
             "state": "busy" if self._current_parser_key else "idle",
             "current_parser_key": self._current_parser_key,
-            "parsers": sorted(self._registry),
             "tasks_completed": self.tasks_completed,
             "tasks_failed": self.tasks_failed,
         }

@@ -1,6 +1,7 @@
 # Data Formats
 from scrapecore.plugins.base import (
     BaseParser,
+    RetryableParseError,
     with_stage_output,
 )
 # Parser Registration
@@ -13,6 +14,7 @@ from scrapecore.plugins.auth import BaseAuth
 
 __all__ = [
     "BaseParser",
+    "RetryableParseError",
     "with_stage_output",
     "ParserRegistry",
     "BaseAuth"

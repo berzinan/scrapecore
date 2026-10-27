@@ -15,7 +15,11 @@ Consumer integration:
         - TaskEnvelopes     (built by a consumer-supplied task factory)
         - ResultEnvelopes   (built by agents)
 
-    The consumer supplies two required callables and one optional hook:
+    The consumer supplies parsers, two required callables and one optional hook:
+
+    parsers: dict[str, parse_fn]
+        Maps parser_key → parse(raw, metadata) -> dict, usually
+        ParserRegistry.as_callable_dict().
 
     task_factory(job: dict) -> list[TaskEnvelope]
         Given a job record, return the first-stage TaskEnvelopes to enqueue.
@@ -62,12 +66,19 @@ from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
+from scrapecore.coordinator.parsing import (
+    ParserFn,
+    decode_body,
+    run_parser,
+    validate_parser_output,
+)
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.queue.task_queue import TaskQueue
 from scrapecore.queue.result_queue import ResultQueue
 from scrapecore.queue.presence import AgentPresence
 from scrapecore.queue.job_tracker import JobTracker
+from scrapecore.plugins.base import RetryableParseError
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +170,10 @@ class Coordinator:
                             Builds follow-up tasks from a stage result.
                             Return None for final-stage results.
         namespace:          Must match the namespace used by agents.
+        parsers:            Dict parser_key → parse(raw, metadata) -> dict.
+                            Usually ParserRegistry.as_callable_dict().
+                            Fetched results whose parser_key is missing
+                            here are exhausted and dead-lettered.
         dispatch_interval:  Seconds between job store polls for new pending jobs.
         recovery_interval:  Seconds between stale task recovery sweeps.
         stale_task_timeout: Seconds a task can sit in processing before recovery.
@@ -182,6 +197,7 @@ class Coordinator:
         task_factory: Callable[[dict], list[TaskEnvelope]],
         stage_handler: Callable[[ResultEnvelope], Optional[list[TaskEnvelope]]],
         namespace: str = "default",
+        parsers: Optional[dict[str, ParserFn]] = None,
         dispatch_interval: float = 1.0,
         recovery_interval: float = 30.0,
         stale_task_timeout: float = 60.0,
@@ -196,6 +212,7 @@ class Coordinator:
         self._task_factory = task_factory
         self._stage_handler = stage_handler
         self._namespace = namespace
+        self._parsers: dict[str, ParserFn] = parsers or {}
         self._dispatch_interval = dispatch_interval
         self._recovery_interval = recovery_interval
         self._stale_task_timeout = stale_task_timeout
@@ -410,6 +427,8 @@ class Coordinator:
             - job cancelled or not tracked      → drop
             - task no longer outstanding        → duplicate: drop, but finalise
                                                   if nothing is outstanding
+            - fetched (raw response)            → parse; may become failed
+                                                  (re-fetch queued) or exhausted
             - otherwise → on_result (with retries), then by status:
             - "failed"                          → no state change (agent retries)
             - "completed" with stage_output     → replace task with follow-ups
@@ -445,6 +464,9 @@ class Coordinator:
                 )
             return
 
+        if result.status == "completed" and result.response is not None:
+            result = await self._parse_fetched(raw, result)
+
         await self._call_on_result(raw, result)
 
         if result.status == "failed":
@@ -473,6 +495,85 @@ class Coordinator:
         logger.info(f"Task {task_id} {outcome}. Job {job_id}: {remaining} task(s) remaining")
         if remaining == 0:
             await self._finalise_job(job_id)
+
+    async def _parse_fetched(self, raw: str, result: ResultEnvelope) -> ResultEnvelope:
+        """
+        Turn a fetched result into a parsed one.
+
+        Outcomes:
+            - parser succeeds          → "completed" with output/stage_output
+            - RetryableParseError      → task re-enqueued with retry_count + 1,
+                                         returns "failed" (task stays outstanding);
+                                         "exhausted" once retries run out
+            - any other error, missing
+              parser or missing task   → "exhausted" immediately: the same
+                                         HTML would fail the same way
+
+        Every exhausted outcome dead-letters the fetched result, raw page
+        included.
+        The returned envelope keeps `response` and `task`, so on_result can
+        archive the raw page if it wants to.
+        """
+        def outcome(status: str, error: str, retry_count: int) -> ResultEnvelope:
+            return ResultEnvelope(
+                task_id=result.task_id,
+                job_id=result.job_id,
+                agent_id=result.agent_id,
+                status=status,
+                retry_count=retry_count,
+                max_retries=result.max_retries,
+                error=error,
+                response=result.response,
+                task=result.task,
+            )
+
+        async def give_up(error: str) -> ResultEnvelope:
+            logger.error(f"Parsing task {result.task_id} failed permanently: {error}")
+            await self._result_queue.dead_letter(raw, f"parse: {error}")
+            return outcome("exhausted", error, result.retry_count)
+
+        if not result.task:
+            return await give_up("fetched result carries no task")
+        task = TaskEnvelope.from_dict(result.task)
+
+        parser_fn = self._parsers.get(task.parser_key)
+        if parser_fn is None:
+            return await give_up(f"no parser registered for {task.parser_key!r}")
+
+        try:
+            parsed = await run_parser(
+                parser_fn, decode_body(result.response), task.payload.get("metadata", {})
+            )
+            output, stage_output = validate_parser_output(task.parser_key, parsed)
+        except RetryableParseError as e:
+            if not task.should_retry():
+                return await give_up(
+                    f"RetryableParseError after {task.max_retries} retries: {e}"
+                )
+            retried = task.increment_retry()
+            await self._task_queue.push(
+                retried.task_id, retried.to_dict(), priority=retried.priority
+            )
+            logger.warning(
+                f"Task {task.task_id} needs re-fetch "
+                f"(attempt {retried.retry_count}/{task.max_retries}): {e}"
+            )
+            return outcome("failed", f"RetryableParseError: {e}", task.retry_count)
+        except Exception as e:
+            return await give_up(f"{type(e).__name__}: {e}")
+
+        return ResultEnvelope(
+            task_id=result.task_id,
+            job_id=result.job_id,
+            agent_id=result.agent_id,
+            status="completed",
+            retry_count=result.retry_count,
+            max_retries=result.max_retries,
+            output=output,
+            stage_output=stage_output,
+            response=result.response,
+            task=result.task,
+        )
 
     async def _handle_stage_transition(self, result: ResultEnvelope) -> bool:
         """
