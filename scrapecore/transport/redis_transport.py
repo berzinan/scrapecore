@@ -5,8 +5,7 @@ RedisTransport — AgentTransport backed directly by the scrapecore Redis queues
 
 Used when an agent can reach Redis itself: local development, tests, and the
 server side of the future HTTPS gateway (which will call these same methods
-on behalf of remote agents). Behaviour matches what Agent did inline before
-transports existed.
+on behalf of remote agents).
 """
 from __future__ import annotations
 
@@ -54,11 +53,6 @@ class RedisTransport:
     async def submit(self, task: TaskEnvelope, result: ResultEnvelope) -> None:
         """
         Push the result, then acknowledge or re-enqueue the task.
-
-        Order matters: the result is pushed before the claim is released. If
-        the process dies in between, the task is still in processing, stale
-        recovery re-runs it, and the coordinator drops the duplicate result.
-        The reverse order could lose the result entirely.
 
         Retry policy:
             completed                          → acknowledge

@@ -7,12 +7,6 @@ The agent never touches Redis directly. It claims tasks, renews claims,
 submits outcomes and reports presence through a transport, so the same agent
 code runs against Redis in-process (RedisTransport) or against a remote
 gateway over HTTPS (HttpTransport, in a later change).
-
-The operations are deliberately coarse. Reporting a task's outcome is a
-single submit() rather than "push result, then acknowledge or re-enqueue":
-over a network that is one round trip instead of three, and the retry
-decision is made by the transport — on the server side once a gateway
-exists — not by the agent.
 """
 from __future__ import annotations
 
