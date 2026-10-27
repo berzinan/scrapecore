@@ -19,8 +19,7 @@ Consumer integration:
 
     parsers: dict[str, parse_fn]
         Maps parser_key → parse(raw, metadata) -> dict, usually
-        ParserRegistry.as_callable_dict(). Agents only fetch; the coordinator
-        parses each fetched response before anything else sees it.
+        ParserRegistry.as_callable_dict().
 
     task_factory(job: dict) -> list[TaskEnvelope]
         Given a job record, return the first-stage TaskEnvelopes to enqueue.
@@ -511,7 +510,7 @@ class Coordinator:
                                          HTML would fail the same way
 
         Every exhausted outcome dead-letters the fetched result, raw page
-        included, so it can be re-parsed after the parser is fixed.
+        included.
         The returned envelope keeps `response` and `task`, so on_result can
         archive the raw page if it wants to.
         """

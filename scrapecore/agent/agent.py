@@ -36,9 +36,9 @@ class Agent:
     """
     Remote worker process. Polls the task queue and fetches each task's URL.
 
-    Agents do not parse. A successful fetch is returned as a "fetched"
-    ResultEnvelope carrying the raw response; the coordinator runs the
-    parser. Agents therefore hold no site-specific code beyond auth.
+    Agents do not parse. Successful fetch is returned as a "fetched"
+    ResultEnvelope carrying the raw response.
+    Coordinator runs the parser. Agents therefore no site-specific code beyond auth.
 
     1 Agent instance == 1 account/session.
     Throughput scaling is achieved by running multiple Agent instances.
@@ -49,8 +49,7 @@ class Agent:
         agent_id:           Unique name for this agent instance.
         redis:              Connected async Redis client.
         namespace:          Must match the namespace used by the coordinator.
-        rate_limit_config:  Dict mapping a task's parser_key (which names the
-                            endpoint) → requests_per_second.
+        rate_limit_config:  Dict mapping a task's parser_key → requests_per_second.
                             Each key gets its own independent rate bucket.
                             Example:
                                 {

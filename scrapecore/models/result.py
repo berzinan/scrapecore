@@ -9,8 +9,8 @@ The result travels through a separate Redis list:
 
 The coordinator polls this list and updates the job store accordingly.
 
-Fetched results (fetch-only agents):
-    Agents do not parse. A successful fetch is sent as
+Fetched results:
+    A successful fetch is sent as
         status   = "completed"
         response = {"status", "content_type", "headers", "text", "url"}
         task     = the originating TaskEnvelope as a dict

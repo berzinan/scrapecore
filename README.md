@@ -125,7 +125,6 @@ def parse(self, raw, metadata):
 
 Run one of these on every worker machine. Agents only **fetch**: they hold
 no parsers, and send each raw response back for the coordinator to parse.
-Fixing a parser therefore never requires touching worker machines.
 
 ```python
 # agent_main.py
