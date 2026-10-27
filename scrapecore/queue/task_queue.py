@@ -89,6 +89,12 @@ class TaskQueue:
         """TODO: Docstring"""
         await self._redis.delete(self._payload_key(task_id))
 
+    async def get_payload(self, task_id: str) -> Optional[dict]:
+        """
+        Return the stored payload of a queued or in-flight task, or None.
+        """
+        return await self._load_payload(task_id)
+
     # ── Producer API ──────────────────────────────────────────────────────────
 
     async def push(self, task_id: str, payload: dict, priority: int = 0) -> None:

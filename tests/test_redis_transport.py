@@ -139,3 +139,9 @@ async def test_heartbeat_and_leave(fake_redis, namespace, transport):
 
     await transport.leave("agent-1")
     assert await presence.list_online() == []
+
+
+async def test_claim_with_zero_timeout_does_not_block(transport):
+    """BLMOVE with timeout 0 blocks forever on real Redis; claim(0) must not."""
+    import asyncio
+    assert await asyncio.wait_for(transport.claim(timeout=0), timeout=2.0) is None

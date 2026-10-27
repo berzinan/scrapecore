@@ -14,7 +14,7 @@ from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
 from scrapecore.plugins.auth import BaseAuth
-from scrapecore.transport.base import AgentTransport
+from scrapecore.transport.base import FATAL_TRANSPORT_ERRORS, AgentTransport, TaskNotHeld
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,11 @@ except PackageNotFoundError: # running from a source tree, not installed
 # After all attempts exhaust, the failure surfaces to the queue-level retry
 # mechanism (TaskEnvelope.max_retries).
 _HTTP_RETRY_BACKOFF: tuple[int, ...] = (10, 20, 40, 80, 160)
+
+# Backoff (seconds) when the transport is unreachable, e.g. the laptop is
+# offline or the gateway is restarting. Doubles up to the cap; resets on success.
+_TRANSPORT_BACKOFF_START = 1.0
+_TRANSPORT_BACKOFF_MAX = 30.0
 
 
 class Agent:
@@ -110,13 +115,23 @@ class Agent:
         self._started_at = time.time()
         self._current_parser_key: Optional[str] = None
 
+        self._fatal_error: Optional[BaseException] = None
+
         self._stage_counts: dict[str, int] = {}
         self._stage_started_at: Optional[float] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start the agent. Blocks until stop() is called."""
+        """
+        Start the agent. Blocks until stop() is called.
+
+        Transient transport failures (server unreachable) are retried with
+        backoff and never stop the agent.
+
+        :raises AuthenticationFailed, UpgradeRequired: if the server rejects
+                this agent. The agent stops, since retrying cannot help.
+        """
         logger.info(f"Agent {self.agent_id!r} starting")
         try:
             async with asyncio.TaskGroup() as tg:
@@ -124,7 +139,26 @@ class Agent:
                 tg.create_task(self._heartbeat_loop())
         finally:
             await self._backend.close()
+            close_transport = getattr(self._transport, "close", None)
+            if close_transport is not None:
+                await close_transport()
+        if self._fatal_error is not None:
+            logger.critical(f"Agent {self.agent_id!r} stopped: {self._fatal_error}")
+            raise self._fatal_error
         logger.info(f"Agent {self.agent_id!r} shut down cleanly")
+
+    def _stop_fatally(self, error: BaseException) -> None:
+        """Record a non-retriable transport error and stop every loop."""
+        if self._fatal_error is None:
+            self._fatal_error = error
+        self._stop_event.set()
+
+    async def _wait(self, seconds: float) -> None:
+        """Sleep, waking early on stop()."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     async def stop(self) -> None:
         """Stop the agent."""
@@ -140,9 +174,23 @@ class Agent:
         One task is in flight at a time per agent.
         """
         logger.debug(f"Agent {self.agent_id!r} run loop started")
+        backoff = _TRANSPORT_BACKOFF_START
 
         while not self._stop_event.is_set():
-            envelope = await self._transport.claim(timeout=self._claim_timeout)
+            try:
+                envelope = await self._transport.claim(timeout=self._claim_timeout)
+            except FATAL_TRANSPORT_ERRORS as e:
+                self._stop_fatally(e)
+                break
+            except Exception as e:
+                logger.warning(
+                    f"Agent {self.agent_id!r} could not claim a task ({e}); "
+                    f"retrying in {backoff:.0f}s"
+                )
+                await self._wait(backoff)
+                backoff = min(backoff * 2, _TRANSPORT_BACKOFF_MAX)
+                continue
+            backoff = _TRANSPORT_BACKOFF_START
             if envelope is None:
                 continue
 
@@ -178,7 +226,23 @@ class Agent:
                 )
         
             # The transport delivers the result and decides retry vs. done.
-            await self._transport.submit(envelope, result)
+            try:
+                await self._transport.submit(envelope, result)
+            except TaskNotHeld:
+                logger.warning(
+                    f"Task {envelope.task_id} was reassigned before agent "
+                    f"{self.agent_id!r} submitted it; result discarded"
+                )
+            except FATAL_TRANSPORT_ERRORS as e:
+                self._stop_fatally(e)
+                break
+            except Exception as e:
+                # The task is still claimed server-side; stale-task recovery
+                # will hand it to an agent again, so nothing is lost for good.
+                logger.error(
+                    f"Agent {self.agent_id!r} could not submit task "
+                    f"{envelope.task_id}: {e}. It will be re-run after stale recovery."
+                )
 
             if result.status == "completed":
                 self.tasks_completed += 1
@@ -209,7 +273,12 @@ class Agent:
         async def _renew_loop() -> None:
             while True:
                 await asyncio.sleep(20)
-                await self._transport.renew(envelope.task_id)
+                try:
+                    await self._transport.renew(envelope.task_id)
+                except Exception as e:
+                    # A missed renewal only risks stale recovery re-running
+                    # the task; the fetch itself carries on.
+                    logger.warning(f"Renewing task {envelope.task_id} failed: {e}")
         self._current_parser_key = envelope.parser_key
         renew_task = asyncio.create_task(_renew_loop())
         try:
@@ -320,22 +389,31 @@ class Agent:
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        """TODO: Docstring"""
+        """
+        Announce presence every heartbeat_interval, with a TTL of three
+        intervals, and announce departure on shutdown. Failures are logged
+        and retried on the next beat; fatal transport errors stop the agent.
+        """
         expiry = int(self._heartbeat_interval * 3)
 
         while not self._stop_event.is_set():
-            await self._transport.heartbeat(self.agent_id, self._heartbeat_info(), expiry)
-            logger.debug(f"Heartbeat written for agent {self.agent_id!r}")
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=self._heartbeat_interval,
-                )
-            except asyncio.TimeoutError:
-                pass
+                await self._transport.heartbeat(self.agent_id, self._heartbeat_info(), expiry)
+                logger.debug(f"Heartbeat sent for agent {self.agent_id!r}")
+            except FATAL_TRANSPORT_ERRORS as e:
+                self._stop_fatally(e)
+                break
+            except Exception as e:
+                logger.warning(f"Heartbeat for agent {self.agent_id!r} failed: {e}")
+            await self._wait(self._heartbeat_interval)
 
-        await self._transport.leave(self.agent_id)
-        logger.debug(f"Agent {self.agent_id!r} left (presence removed)")
+        if self._fatal_error is None:
+            try:
+                await self._transport.leave(self.agent_id)
+                logger.debug(f"Agent {self.agent_id!r} left (presence removed)")
+            except Exception as e:
+                # Presence expires on its own after the heartbeat TTL.
+                logger.warning(f"Agent {self.agent_id!r} could not announce leaving: {e}")
 
     def _heartbeat_info(self) -> dict[str, Any]:
         """TODO: Docstring"""
