@@ -3,12 +3,9 @@ scrapecore/coordinator/lock.py
 
 CoordinatorLock — guarantees at most one active coordinator per namespace.
 
-The coordinator's correctness rests on being the only one running: its
-startup recovery moves every in-flight result back to the queue, and its
-reconcile step re-dispatches any running job it is not tracking. Two
+The coordinator's correctness rests on being the only one running: 2
 coordinators would steal each other's in-flight results and double-dispatch
-jobs. This lock turns "run exactly one coordinator" from an assumption into
-a guarantee.
+jobs.
 
 Mechanism (a standard Redis lease):
     acquire  SET key <token> NX PX <ttl>   — only if nobody holds it
@@ -22,10 +19,10 @@ and was taken by someone else in between.
 Key:
     scrapecore:{namespace}:coordinator:lock   value: unique per instance
 
-Limitation: the lock is a lease, not a fence. If a coordinator is paused for
-longer than the TTL (debugger, VM freeze, multi-second GC), another one can
-take over while the first is mid-operation, before the first notices on its
-next renewal. Keep the TTL comfortably above any plausible pause.
+Limitation: If a coordinator is paused for longer than the TTL (debugger, VM freeze, ...),
+another one can take over while the first is mid-operation, before the first notices on its
+next renewal.
+Keep TTL comfortably above any plausible pause.
 """
 from __future__ import annotations
 

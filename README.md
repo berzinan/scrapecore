@@ -437,9 +437,9 @@ redis:
 
 ### One active coordinator per namespace
 
-Only one coordinator per namespace may run at a time; two would steal each
-other's in-flight results and dispatch jobs twice. This is enforced with a
-Redis lock (`scrapecore:{namespace}:coordinator:lock`):
+Only 1 coordinator per namespace may run at a time.
+This is enforced with a Redis lock
+(`scrapecore:{namespace}:coordinator:lock`):
 
 - `start()` takes the lock before doing anything. If another coordinator
   holds it, the new one waits as a **standby** and takes over within
@@ -449,11 +449,6 @@ Redis lock (`scrapecore:{namespace}:coordinator:lock`):
   standby took over), it stops all work and `start()` raises
   `CoordinatorLockLost`. Restart the process and it rejoins as a standby.
 - A clean `stop()` releases the lock immediately.
-
-Running a standby on a second process or machine therefore gives you
-failover for free. Keep `lock_ttl` well above any pause the process could
-plausibly suffer: the lock is a lease, so a coordinator frozen past the TTL
-can finish the step it was in before noticing it lost the lock.
 
 ---
 

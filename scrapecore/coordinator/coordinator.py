@@ -3,8 +3,8 @@ scrapecore/coordinator/coordinator.py
 
 Coordinator — server-side orchestration process.
 
-Only one coordinator per namespace is active at a time (CoordinatorLock).
-start() waits as a standby until it holds the lock, then runs five loops:
+Only 1 coordinator per namespace is active at a time (CoordinatorLock).
+start() waits as a standby until it holds the lock, then runs 5 loops:
     1. dispatch_loop    — picks up pending jobs, builds and enqueues TaskEnvelopes
     2. result_loop      — drains ResultEnvelopes, updates job state, triggers stages
     3. recovery_loop    — re-enqueues tasks whose agents died mid-execution
@@ -44,7 +44,7 @@ Result delivery:
     Results are claimed from Redis with claim() and acked only after the
     hook and job bookkeeping succeed. Any other failure requeues it.
     Results left in-flight by a crashed coordinator are recovered at the next start().
-    Safe because CoordinatorLock guarantees no other coordinator is running.
+    CoordinatorLock guarantees no other coordinator is running.
 
 Coordinator state:
     Which tasks each running job is still waiting on lives in Redis (JobTracker).
@@ -251,8 +251,7 @@ class Coordinator:
         Wait for the coordinator lock, then run all loops until stop().
 
         While another coordinator holds the lock this waits as a standby,
-        retrying every lock_ttl/3, so a second instance never runs alongside
-        the first and takes over at most lock_ttl after the first dies.
+        retrying every lock_ttl/3.
 
         :raises CoordinatorLockLost: if the lock was lost while running.
                 Every loop has already stopped; restart the process and it
@@ -834,8 +833,7 @@ class Coordinator:
 
         If renewal reports the lock is no longer ours, or Redis has been
         unreachable for a full lock_ttl (so the lease has expired and a
-        standby may have taken it), stop every loop. Continuing would mean
-        two coordinators running at once.
+        standby may have taken it), stop every loop.
         """
         interval = self._lock.ttl / 3
         last_renewed = time.monotonic()
