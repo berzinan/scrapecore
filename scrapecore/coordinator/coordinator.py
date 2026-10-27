@@ -3,11 +3,13 @@ scrapecore/coordinator/coordinator.py
 
 Coordinator — server-side orchestration process.
 
-Runs four concurrent loops:
+Only one coordinator per namespace is active at a time (CoordinatorLock).
+start() waits as a standby until it holds the lock, then runs five loops:
     1. dispatch_loop    — picks up pending jobs, builds and enqueues TaskEnvelopes
     2. result_loop      — drains ResultEnvelopes, updates job state, triggers stages
     3. recovery_loop    — re-enqueues tasks whose agents died mid-execution
     4. heartbeat_loop   — writes coordinator liveness key to Redis
+    5. lock_loop        — renews the lock; stops everything if it is lost
 
 Consumer integration:
     The coordinator operates entirely on:
@@ -42,7 +44,7 @@ Result delivery:
     Results are claimed from Redis with claim() and acked only after the
     hook and job bookkeeping succeed. Any other failure requeues it.
     Results left in-flight by a crashed coordinator are recovered at the next start().
-    This assumes exactly one coordinator runs per namespace.
+    Safe because CoordinatorLock guarantees no other coordinator is running.
 
 Coordinator state:
     Which tasks each running job is still waiting on lives in Redis (JobTracker).
@@ -66,6 +68,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
+from scrapecore.coordinator.lock import CoordinatorLock, CoordinatorLockLost
 from scrapecore.coordinator.parsing import (
     ParserFn,
     decode_body,
@@ -188,6 +191,9 @@ class Coordinator:
                             each retry, capped at 30s.
         result_retry_delay: Pause after a result is requeued because handling
                             failed outside the hook (e.g. job store down).
+        lock_ttl:           Seconds the coordinator lock lasts without renewal.
+                            Renewed every lock_ttl/3. A standby takes over at
+                            most lock_ttl after the active coordinator dies.
     """
 
     def __init__(
@@ -206,6 +212,7 @@ class Coordinator:
         hook_max_attempts: int = 5,
         hook_retry_base_delay: float = 1.0,
         result_retry_delay: float = 1.0,
+        lock_ttl: float = 30.0,
     ) -> None:
         self._redis = redis
         self._store = job_store_adapter
@@ -229,6 +236,10 @@ class Coordinator:
 
         self._stop_event = asyncio.Event()
 
+        self._lock = CoordinatorLock(redis, namespace, ttl=lock_ttl)
+        self._holds_lock = False
+        self._lock_lost = False
+
         # Serialises "push tasks + update tracker" (dispatch, stage
         # transitions) against result handling.
         self._state_lock = asyncio.Lock()
@@ -237,22 +248,82 @@ class Coordinator:
 
     async def start(self) -> None:
         """
-        Start all coordinator loops. Blocks until stop() is called.
+        Wait for the coordinator lock, then run all loops until stop().
+
+        While another coordinator holds the lock this waits as a standby,
+        retrying every lock_ttl/3, so a second instance never runs alongside
+        the first and takes over at most lock_ttl after the first dies.
+
+        :raises CoordinatorLockLost: if the lock was lost while running.
+                Every loop has already stopped; restart the process and it
+                rejoins as a standby.
         """
         logger.info("Coordinator starting")
-        # Results a previous (crashed) coordinator claimed but never acked.
-        await self._result_queue.recover_inflight()
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._dispatch_loop())
-            tg.create_task(self._result_loop())
-            tg.create_task(self._recovery_loop())
-            tg.create_task(self._heartbeat_loop())
+        if not await self._acquire_lock():
+            logger.info("Coordinator stopped while on standby")
+            return
+
+        try:
+            # Results a previous (crashed) coordinator claimed but never acked.
+            # Safe only because we hold the lock: nobody else is mid-result.
+            await self._result_queue.recover_inflight()
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._dispatch_loop())
+                tg.create_task(self._result_loop())
+                tg.create_task(self._recovery_loop())
+                tg.create_task(self._heartbeat_loop())
+                tg.create_task(self._lock_loop())
+        finally:
+            self._holds_lock = False
+            if not self._lock_lost:
+                try:
+                    await self._lock.release()
+                except Exception as e:
+                    # Lock expires on its own after lock_ttl.
+                    logger.error(f"Releasing coordinator lock failed: {e}")
+
+        if self._lock_lost:
+            raise CoordinatorLockLost(
+                "Coordinator lost its lock to another instance and stopped."
+            )
         logger.info("Coordinator stopped")
 
     async def stop(self) -> None:
-        """#TODO: Docstring"""
+        """
+        Ask the coordinator to stop. start() returns once the loops finish
+        their current step; a coordinator on standby returns immediately.
+        """
         logger.info("Coordinator stop requested")
         self._stop_event.set()
+
+    @property
+    def holds_lock(self) -> bool:
+        """True while this instance is the active coordinator."""
+        return self._holds_lock
+
+    async def _acquire_lock(self) -> bool:
+        """
+        Block until this instance holds the coordinator lock.
+        :return: False if stop() was called first.
+        """
+        waiting_logged = False
+        while not self._stop_event.is_set():
+            try:
+                if await self._lock.acquire():
+                    self._holds_lock = True
+                    logger.info(f"Coordinator lock acquired ({self._lock.token})")
+                    return True
+                if not waiting_logged:
+                    holder = await self._lock.holder()
+                    logger.warning(
+                        f"Another coordinator holds the lock ({holder}) — "
+                        f"waiting as standby"
+                    )
+                    waiting_logged = True
+            except Exception as e:
+                logger.error(f"Coordinator lock acquire failed: {e}")
+            await self._sleep(self._lock.ttl / 3)
+        return False
 
     async def cancel_job(self, job_id: str) -> int:
         """
@@ -401,6 +472,16 @@ class Coordinator:
                 continue
 
             raw, result = claimed
+            if self._stop_event.is_set():
+                # claim() blocks for up to 2s and cannot be interrupted, so it
+                # can return after stop() — or after the lock was lost and
+                # another coordinator took over. Never handle that result
+                # here; hand it back so whoever runs next processes it.
+                try:
+                    await self._result_queue.requeue(raw)
+                except Exception as e:
+                    logger.error(f"Requeue during shutdown failed: {e}", exc_info=True)
+                break
             try:
                 async with self._state_lock:
                     await self._process_result(raw, result)
@@ -744,3 +825,36 @@ class Coordinator:
                 pass
 
         await self._redis.delete(key)
+
+    # ── Loop 5: lock ──────────────────────────────────────────────────────────
+
+    async def _lock_loop(self) -> None:
+        """
+        Renew the coordinator lock every lock_ttl/3.
+
+        If renewal reports the lock is no longer ours, or Redis has been
+        unreachable for a full lock_ttl (so the lease has expired and a
+        standby may have taken it), stop every loop. Continuing would mean
+        two coordinators running at once.
+        """
+        interval = self._lock.ttl / 3
+        last_renewed = time.monotonic()
+        while not self._stop_event.is_set():
+            if await self._sleep(interval):
+                return
+            try:
+                if await self._lock.renew():
+                    last_renewed = time.monotonic()
+                    continue
+                reason = "it expired or another coordinator now holds it"
+            except Exception as e:
+                if time.monotonic() - last_renewed < self._lock.ttl:
+                    logger.warning(f"Coordinator lock renewal failed, will retry: {e}")
+                    continue
+                reason = f"renewal failed for {self._lock.ttl:.0f}s ({e})"
+
+            logger.critical(f"Coordinator lost its lock: {reason}. Stopping.")
+            self._lock_lost = True
+            self._holds_lock = False
+            self._stop_event.set()
+            return

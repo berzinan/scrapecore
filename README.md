@@ -435,7 +435,25 @@ redis:
     - redisdata:/data
 ```
 
-Run exactly one coordinator per namespace.
+### One active coordinator per namespace
+
+Only one coordinator per namespace may run at a time; two would steal each
+other's in-flight results and dispatch jobs twice. This is enforced with a
+Redis lock (`scrapecore:{namespace}:coordinator:lock`):
+
+- `start()` takes the lock before doing anything. If another coordinator
+  holds it, the new one waits as a **standby** and takes over within
+  `lock_ttl` (default 30s) of the active one dying.
+- The active coordinator renews the lock every `lock_ttl / 3`. If it ever
+  finds the lock gone (e.g. it was frozen longer than `lock_ttl` and a
+  standby took over), it stops all work and `start()` raises
+  `CoordinatorLockLost`. Restart the process and it rejoins as a standby.
+- A clean `stop()` releases the lock immediately.
+
+Running a standby on a second process or machine therefore gives you
+failover for free. Keep `lock_ttl` well above any pause the process could
+plausibly suffer: the lock is a lease, so a coordinator frozen past the TTL
+can finish the step it was in before noticing it lost the lock.
 
 ---
 
@@ -476,7 +494,8 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
                         │  ├── dispatch_loop          │
                         │  ├── result_loop (parses)   │
                         │  ├── recovery_loop          │
-                        │  └── heartbeat_loop         │
+                        │  ├── heartbeat_loop         │
+                        │  └── lock_loop              │
                         │      │            ▲         │
                         │   TaskQueue   ResultQueue   │
                         │      │(Redis)      │(Redis) │
@@ -508,6 +527,7 @@ The unit suite uses `fakeredis` and `aioresponses` — no Redis, no network.
 | `BaseParser`            | Consumer-supplied parse + task-building logic.            |
 | `with_stage_output()`   | Wraps a parser's output to trigger the next stage.        |
 | `ParserRegistry`        | Maps `parser_key` → parser, routes jobs by `site`.        |
+| `CoordinatorLock`       | Redis lease: one active coordinator per namespace, others wait as standby. |
 | `JobStoreAdapter`       | Narrow interface to whatever holds job records.           |
 | `DistributedRateLimiter`| Optional Redis-backed global rate cap per domain.         |
 
