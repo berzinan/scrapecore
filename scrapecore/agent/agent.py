@@ -8,16 +8,13 @@ import socket
 import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any, Optional
-import redis.asyncio as aioredis
 
 from scrapecore.http.base import HttpBackend, HttpBackendError, NetworkError, ScrapeFailedError
 from scrapecore.http.aiohttp_backend import AiohttpBackend
 from scrapecore.models.task import TaskEnvelope
 from scrapecore.models.result import ResultEnvelope
-from scrapecore.queue.task_queue import TaskQueue
-from scrapecore.queue.result_queue import ResultQueue
-from scrapecore.queue.presence import AgentPresence
 from scrapecore.plugins.auth import BaseAuth
+from scrapecore.transport.base import AgentTransport
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +40,17 @@ class Agent:
     1 Agent instance == 1 account/session.
     Throughput scaling is achieved by running multiple Agent instances.
     The run loop is a single sequential coroutine:
-    claim → rate-limit → fetch → push result.
+    claim → rate-limit → fetch → submit result.
+
+    The agent talks to the server only through its transport, never to
+    Redis directly, so the same agent runs in-process against Redis
+    (RedisTransport) or remotely through a gateway.
 
     Args:
         agent_id:           Unique name for this agent instance.
-        redis:              Connected async Redis client.
-        namespace:          Must match the namespace used by the coordinator.
+        transport:          AgentTransport used to claim tasks, submit
+                            results and report presence, e.g.
+                            RedisTransport(redis, namespace).
         rate_limit_config:  Dict mapping a task's parser_key → requests_per_second.
                             Each key gets its own independent rate bucket.
                             Example:
@@ -60,7 +62,7 @@ class Agent:
                             Parser keys absent from this dict fall back to
                             1.0 RPS, domain-keyed.
         claim_timeout:      Seconds the run loop blocks on an empty queue.
-        heartbeat_interval: Seconds between heartbeat writes to Redis.
+        heartbeat_interval: Seconds between heartbeats sent via the transport.
         task_timeout:       Total HTTP timeout in seconds.
                             Ignored if custom http_backend is provided.
         proxy:              Proxy URL forwarded to every backend request.
@@ -72,8 +74,7 @@ class Agent:
     def __init__(
         self,
         agent_id: str,
-        redis: aioredis.Redis,
-        namespace: str = "default",
+        transport: AgentTransport,
         rate_limit_config: dict[str, float] | None = None,
         claim_timeout: float = 5.0,
         heartbeat_interval: float = 10.0,
@@ -83,8 +84,7 @@ class Agent:
         auth_provider: BaseAuth | None = None,
     ) -> None:
         self.agent_id = agent_id
-        self._redis = redis
-        self._namespace = namespace
+        self._transport = transport
         self._rate_limit_config: dict[str, float] = rate_limit_config or {}
         self._claim_timeout = claim_timeout
         self._heartbeat_interval = heartbeat_interval
@@ -97,10 +97,6 @@ class Agent:
         )
 
         self._auth_provider = auth_provider
-
-        self._task_queue = TaskQueue(redis, namespace)
-        self._result_queue = ResultQueue(redis, namespace)
-        self._presence = AgentPresence(redis, namespace)
 
         self._stop_event = asyncio.Event()
 
@@ -139,19 +135,16 @@ class Agent:
 
     async def _run_loop(self) -> None:
         """
-        Single sequential execution loop: claim → execute → push.
+        Single sequential execution loop: claim → execute → submit.
 
         One task is in flight at a time per agent.
         """
         logger.debug(f"Agent {self.agent_id!r} run loop started")
 
         while not self._stop_event.is_set():
-            claimed = await self._task_queue.claim(timeout=self._claim_timeout)
-            if claimed is None:
+            envelope = await self._transport.claim(timeout=self._claim_timeout)
+            if envelope is None:
                 continue
-
-            task_id, raw_payload = claimed
-            envelope = TaskEnvelope.from_dict(raw_payload)
 
             try:
                 result = await self._execute(envelope)
@@ -184,20 +177,12 @@ class Agent:
                     error=f"Unhandled: {type(e).__name__}: {e}",
                 )
         
-            await self._result_queue.push(result)
+            # The transport delivers the result and decides retry vs. done.
+            await self._transport.submit(envelope, result)
 
             if result.status == "completed":
-                await self._task_queue.acknowledge(task_id)
                 self.tasks_completed += 1
             else:
-                cancelled = await self._redis.sismember(
-                    f"scrapecore:{self._namespace}:cancelled_jobs", envelope.job_id
-                )
-                if cancelled or not envelope.should_retry():
-                    await self._task_queue.acknowledge(task_id)
-                else:
-                    retried = envelope.increment_retry()
-                    await self._task_queue.reject(task_id, retried.to_dict(), retried.priority)
                 self.tasks_failed += 1
 
         logger.debug(f"Agent {self.agent_id!r} run loop exited")
@@ -224,7 +209,7 @@ class Agent:
         async def _renew_loop() -> None:
             while True:
                 await asyncio.sleep(20)
-                await self._task_queue.renew_claim(envelope.task_id)
+                await self._transport.renew(envelope.task_id)
         self._current_parser_key = envelope.parser_key
         renew_task = asyncio.create_task(_renew_loop())
         try:
@@ -339,7 +324,7 @@ class Agent:
         expiry = int(self._heartbeat_interval * 3)
 
         while not self._stop_event.is_set():
-            await self._presence.beat(self.agent_id, self._heartbeat_info(), expiry)
+            await self._transport.heartbeat(self.agent_id, self._heartbeat_info(), expiry)
             logger.debug(f"Heartbeat written for agent {self.agent_id!r}")
             try:
                 await asyncio.wait_for(
@@ -349,8 +334,8 @@ class Agent:
             except asyncio.TimeoutError:
                 pass
 
-        await self._presence.remove(self.agent_id)
-        logger.debug(f"Heartbeat key deleted for agent {self.agent_id!r}")
+        await self._transport.leave(self.agent_id)
+        logger.debug(f"Agent {self.agent_id!r} left (presence removed)")
 
     def _heartbeat_info(self) -> dict[str, Any]:
         """TODO: Docstring"""
